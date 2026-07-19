@@ -1,0 +1,7 @@
+# Device-tree aliases keep the DQ08 display controller on I2C bus 1.
+DQ08_I2C_DEVICE=/dev/i2c-1
+
+# Delays are in seconds.
+DQ08_SCROLL_DELAY=0.18
+DQ08_PAGE_DELAY=0.5
+DQ08_REFRESH_DELAY=2

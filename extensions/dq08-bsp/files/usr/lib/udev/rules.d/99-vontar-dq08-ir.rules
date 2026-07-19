@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Load the three NEC key tables shipped with the original DQ08 BSP.
+ACTION=="add", SUBSYSTEM=="rc", DRIVERS=="gpio_ir_recv", TEST=="/usr/bin/ir-keytable", RUN+="/usr/bin/ir-keytable -s %k -c -w /etc/rc_keymaps/dq08.toml"

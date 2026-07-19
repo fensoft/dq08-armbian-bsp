@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Armbian DQ08 support <support@armbian.com>
+Date: Sat, 18 Jul 2026 00:00:00 +0200
+Subject: [PATCH] arm: dts: rk3528: enable I2C1 for DQ08 preboot
+
+The DQ08 front panel needs three I2C register writes before distro boot.
+Make I2C1 and its pinmux available in all U-Boot phases. Drop the Linux
+power-domain reference from the U-Boot-only view so early probing does
+not depend on a power-domain provider. Give the controller a stable bus
+number for the preboot command.
+---
+ arch/arm/dts/rk3528-u-boot.dtsi | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/arch/arm/dts/rk3528-u-boot.dtsi b/arch/arm/dts/rk3528-u-boot.dtsi
+index 09622e305700..e4b822b56a14 100644
+--- a/arch/arm/dts/rk3528-u-boot.dtsi
++++ b/arch/arm/dts/rk3528-u-boot.dtsi
+@@ -4,6 +4,7 @@
+ 
+ / {
+ 	aliases {
++		i2c0 = &i2c1;
+ 		mmc0 = &sdhci;
+ 		mmc1 = &sdmmc;
+ 	};
+@@ -57,6 +58,19 @@
+ 	bootph-all;
+ };
+ 
++&i2c1 {
++	clock-frequency = <100000>;
++	pinctrl-names = "default";
++	pinctrl-0 = <&i2c1m0_xfer>;
++	/delete-property/ power-domains;
++	status = "okay";
++	bootph-all;
++};
++
++&i2c1m0_xfer {
++	bootph-all;
++};
++
+ &sdhci {
+ 	bootph-pre-ram;
+ };
+-- 
+2.47.3
+

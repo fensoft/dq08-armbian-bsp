@@ -1,0 +1,183 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Drive the Vontar DQ08 four-digit I2C front panel."""
+
+import fcntl
+import os
+import struct
+import subprocess
+import time
+
+
+I2C_SLAVE = 0x0703
+CONTROL_ADDRESS = 0x24
+DIGIT_ADDRESSES = (0x34, 0x35, 0x36, 0x37)
+
+# Conventional active-high seven-segment glyphs (gfedcba).
+SEGMENTS = {
+    " ": 0x00,
+    "-": 0x40,
+    "_": 0x08,
+    "0": 0x3F,
+    "1": 0x06,
+    "2": 0x5B,
+    "3": 0x4F,
+    "4": 0x66,
+    "5": 0x6D,
+    "6": 0x7D,
+    "7": 0x07,
+    "8": 0x7F,
+    "9": 0x6F,
+    "A": 0x77,
+    "B": 0x7C,
+    "C": 0x39,
+    "D": 0x5E,
+    "E": 0x79,
+    "F": 0x71,
+    "G": 0x6F,
+    "H": 0x76,
+    "I": 0x06,
+    "J": 0x1E,
+    "L": 0x38,
+    "M": 0x37,
+    "N": 0x54,
+    "O": 0x3F,
+    "P": 0x73,
+    "Q": 0x67,
+    "R": 0x50,
+    "S": 0x6D,
+    "T": 0x78,
+    "U": 0x3E,
+    "Y": 0x6E,
+}
+
+
+class FrontPanel:
+    """Small raw-I2C interface matching the DQ08 display controller."""
+
+    def __init__(self, device):
+        self.fd = os.open(device, os.O_RDWR | os.O_CLOEXEC)
+        self.address = None
+        self.frame = [None] * len(DIGIT_ADDRESSES)
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def write(self, address, value):
+        if address != self.address:
+            fcntl.ioctl(self.fd, I2C_SLAVE, address)
+            self.address = address
+        os.write(self.fd, struct.pack("B", value & 0xFF))
+
+    def initialize(self):
+        self.write(CONTROL_ADDRESS, 0x01)
+
+    def show(self, frame):
+        for index, (old, new) in enumerate(zip(self.frame, frame)):
+            if old != new:
+                self.write(DIGIT_ADDRESSES[index], new)
+        self.frame = list(frame)
+
+
+def encode(text):
+    """Convert text to glyphs, folding a dot into the preceding digit."""
+    glyphs = []
+    for character in text.upper():
+        if character == "." and glyphs:
+            glyphs[-1] |= 0x80
+        else:
+            glyphs.append(SEGMENTS.get(character, 0x00))
+    return glyphs
+
+
+def scroll(panel, text, delay):
+    panel.write(CONTROL_ADDRESS, 0x01)
+    glyphs = ([0x00] * 4) + encode(text) + ([0x00] * 4)
+    for offset in range(len(glyphs) - 3):
+        panel.show(glyphs[offset : offset + 4])
+        time.sleep(delay)
+
+
+def cpu_sample():
+    with open("/proc/stat", "r", encoding="ascii") as stat_file:
+        fields = [int(value) for value in stat_file.readline().split()[1:8]]
+    total = sum(fields)
+    idle = fields[3] + fields[4]
+    return total, idle
+
+
+def cpu_percent(previous):
+    current = cpu_sample()
+    total_delta = current[0] - previous[0]
+    idle_delta = current[1] - previous[1]
+    if total_delta <= 0:
+        return 0, current
+    percent = round(100 * (total_delta - idle_delta) / total_delta)
+    return max(0, min(100, percent)), current
+
+
+def memory_percent():
+    values = {}
+    with open("/proc/meminfo", "r", encoding="ascii") as meminfo:
+        for line in meminfo:
+            name, value, *_ = line.split()
+            if name in ("MemTotal:", "MemAvailable:"):
+                values[name] = int(value)
+    total = values.get("MemTotal:", 0)
+    available = values.get("MemAvailable:", total)
+    return round(100 * (total - available) / total) if total else 0
+
+
+def primary_ip():
+    try:
+        output = subprocess.run(
+            ("hostname", "-I"),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        ).stdout
+        return next(iter(output.split()), "0.0.0.0")
+    except (OSError, subprocess.SubprocessError):
+        return "0.0.0.0"
+
+
+def positive_float(name, default):
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        value = float(default)
+    return value if value > 0 else float(default)
+
+
+def main():
+    device = os.environ.get("DQ08_I2C_DEVICE", "/dev/i2c-1")
+    scroll_delay = positive_float("DQ08_SCROLL_DELAY", "0.18")
+    page_delay = positive_float("DQ08_PAGE_DELAY", "0.5")
+    refresh_delay = positive_float("DQ08_REFRESH_DELAY", "2")
+
+    panel = FrontPanel(device)
+    try:
+        panel.initialize()
+        previous_cpu = cpu_sample()
+        time.sleep(0.25)
+
+        while True:
+            cpu, previous_cpu = cpu_percent(previous_cpu)
+            pages = (
+                f"IP {primary_ip()}",
+                f"CPU {cpu}",
+                f"RAM {memory_percent()}",
+            )
+            for page in pages:
+                scroll(panel, page, scroll_delay)
+                time.sleep(page_delay)
+            time.sleep(refresh_delay)
+    finally:
+        panel.close()
+
+
+if __name__ == "__main__":
+    main()

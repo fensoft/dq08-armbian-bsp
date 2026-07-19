@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[Unit]
+Description=Vontar DQ08 front-panel display
+After=systemd-modules-load.service network.target
+ConditionPathExists=/dev/i2c-1
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/dq08-front-panel
+ExecStart=/usr/libexec/dq08-front-panel
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

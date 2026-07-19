@@ -1,0 +1,10 @@
+# mode  path relative to this repository and to armbian-build/userpatches
+0644 config/boards/vontar-dq08.csc
+0644 extensions/dq08-bsp/dq08-bsp.sh
+0644 extensions/dq08-bsp/files/etc/default/dq08-front-panel
+0644 extensions/dq08-bsp/files/etc/rc_keymaps/dq08.toml
+0644 extensions/dq08-bsp/files/usr/lib/systemd/system/dq08-front-panel.service
+0644 extensions/dq08-bsp/files/usr/lib/udev/rules.d/99-vontar-dq08-ir.rules
+0755 extensions/dq08-bsp/files/usr/libexec/dq08-front-panel
+0644 kernel/archive/rockchip64-6.18/dt/rk3528-vontar-dq08.dts
+0644 u-boot/v2026.04/board_vontar-dq08/0001-arm-dts-rk3528-enable-dq08-i2c1.patch
