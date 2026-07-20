@@ -62,7 +62,7 @@ class PreflightTests(unittest.TestCase):
         values = {
             "DQ08_BOARD": "vontar-dq08",
             "DQ08_MAINTAINER": "fensoft",
-            "DQ08_MAINTAINER_EMAIL": "fensoft@users.noreply.github.com",
+            "DQ08_MAINTAINER_EMAIL": "fensoft@gmail.com",
         }
         command = preflight.config_command(Path("/tmp/armbian"), values, "a" * 40)
         self.assertIn("RELEASE=bookworm", command)

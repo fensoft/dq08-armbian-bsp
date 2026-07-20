@@ -89,7 +89,7 @@ def make_release_fixture(root: Path) -> SimpleNamespace:
         "DQ08_RKBIN_DDR_SHA256": sha256(ddr_data),
         "DQ08_RKBIN_BL31_SHA256": sha256(bl31_data),
         "DQ08_MAINTAINER": "fensoft",
-        "DQ08_MAINTAINER_EMAIL": "fensoft@users.noreply.github.com",
+        "DQ08_MAINTAINER_EMAIL": "fensoft@gmail.com",
     }
     bsp = root / "bsp"
     bsp_commit = init_repo(bsp, {"module.conf": module_conf(values)})
@@ -122,7 +122,7 @@ def make_release_fixture(root: Path) -> SimpleNamespace:
             "ddr": {"path": ddr_path, "sha256": sha256(ddr_data)},
             "bl31": {"path": bl31_path, "sha256": sha256(bl31_data)},
         },
-        "maintainer": {"name": "fensoft", "email": "fensoft@users.noreply.github.com"},
+        "maintainer": {"name": "fensoft", "email": "fensoft@gmail.com"},
         "build": {
             "board": "vontar-dq08",
             "branch": "current",
@@ -153,7 +153,7 @@ def make_release_fixture(root: Path) -> SimpleNamespace:
                 "Board:          Vontar-dq08",
                 "Kernel:         Linux 6.18.40 (current)",
                 f"Sources rev:    {armbian_commit[:10]}",
-                "Maintainer:     fensoft <fensoft@users.noreply.github.com>",
+                "Maintainer:     fensoft <fensoft@gmail.com>",
                 "",
             )
         ),

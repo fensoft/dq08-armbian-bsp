@@ -18,7 +18,7 @@ class BuildReleaseTests(unittest.TestCase):
         self.module = {
             "DQ08_BOARD": "vontar-dq08",
             "DQ08_MAINTAINER": "fensoft",
-            "DQ08_MAINTAINER_EMAIL": "fensoft@users.noreply.github.com",
+            "DQ08_MAINTAINER_EMAIL": "fensoft@gmail.com",
         }
 
     def test_commands_rebuild_only_kernel_and_uboot_artifacts(self) -> None:
