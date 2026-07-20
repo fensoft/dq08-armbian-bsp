@@ -21,6 +21,8 @@ resource "oci_objectstorage_object_lifecycle_policy" "staging" {
   namespace = data.oci_objectstorage_namespace.this.namespace
   bucket    = oci_objectstorage_bucket.staging.name
 
+  depends_on = [oci_identity_policy.object_lifecycle_service]
+
   rules {
     action      = "DELETE"
     is_enabled  = true
@@ -48,4 +50,11 @@ resource "oci_objectstorage_preauthrequest" "publisher_read" {
   access_type           = "AnyObjectRead"
   bucket_listing_action = "Deny"
   time_expires          = var.staging_par_expiration
+
+  # OCI enforces Deny but currently omits this default when reading the PAR
+  # back. Ignore that API normalization so every refresh does not revoke and
+  # replace the bearer URL. New and deliberately rotated PARs still send Deny.
+  lifecycle {
+    ignore_changes = [bucket_listing_action]
+  }
 }

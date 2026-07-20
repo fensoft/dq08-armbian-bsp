@@ -9,6 +9,8 @@ DQ08 release pipeline:
 - a dedicated public subnet with SSH restricted to `admin_ssh_cidr` and outbound
   traffic restricted to HTTP(S), DNS, and NTP;
 - a private Object Storage bucket whose objects expire after three days;
+- the regional Object Storage service permission required to enforce those
+  lifecycle rules inside the dedicated DQ08 compartment;
 - a bucket-scoped instance principal for multipart uploads; and
 - a read-only, non-listing pre-authenticated request (PAR) for the hosted GitHub
   publisher job.
@@ -16,6 +18,11 @@ DQ08 release pipeline:
 The VM is disposable. Docker data, the runner work directory, and the Armbian
 cache live on the detachable volume. The stack deliberately never receives a
 GitHub registration token, PAT, deploy key, or other long-lived GitHub secret.
+
+OCI executes lifecycle rules as the regional Object Storage service. The stack
+therefore creates Oracle's required root-compartment service policy, scoped to
+the dedicated DQ08 compartment. This policy is separate from the narrower
+instance-principal policy used by the builder itself.
 
 ## Prerequisites
 

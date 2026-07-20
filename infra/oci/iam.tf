@@ -6,6 +6,19 @@ resource "oci_identity_dynamic_group" "builder" {
   freeform_tags  = local.common_tags
 }
 
+# OCI lifecycle rules execute as the regional Object Storage service, not as
+# the user applying this stack. Oracle requires this root-compartment policy
+# before the service can delete expired objects or abort multipart uploads.
+resource "oci_identity_policy" "object_lifecycle_service" {
+  compartment_id = var.tenancy_ocid
+  name           = "${var.name_prefix}-object-lifecycle"
+  description    = "Permit the regional Object Storage service to enforce lifecycle rules in the dedicated DQ08 compartment."
+
+  statements = [
+    "Allow service objectstorage-${var.region} to manage object-family in compartment id ${var.compartment_ocid}",
+  ]
+}
+
 resource "oci_identity_policy" "builder_staging_upload" {
   compartment_id = var.compartment_ocid
   name           = "${var.name_prefix}-staging-upload"
