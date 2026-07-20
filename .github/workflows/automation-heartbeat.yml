@@ -1,0 +1,35 @@
+name: Automation State Heartbeat
+
+on:
+  schedule:
+    - cron: "23 6 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dq08-armbian-release
+  cancel-in-progress: false
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out workflow helpers
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Update monthly heartbeat
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          heartbeat_file="${RUNNER_TEMP}/heartbeat.txt"
+          date --utc '+%Y-%m-%dT%H:%M:%SZ' > "${heartbeat_file}"
+          ./.github/scripts/put_branch_file.sh \
+            automation-state automation/heartbeat.txt "${heartbeat_file}" \
+            "chore(automation): monthly heartbeat"

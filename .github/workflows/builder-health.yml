@@ -1,0 +1,53 @@
+name: DQ08 Builder Health
+
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: dq08-builder-health
+  cancel-in-progress: true
+
+jobs:
+  health:
+    name: ARM64 builder is usable
+    if: github.event_name == 'workflow_dispatch' || vars.DQ08_RELEASE_SCHEDULE_ENABLED == 'true'
+    runs-on: [self-hosted, Linux, ARM64, dq08-builder]
+    timeout-minutes: 10
+    steps:
+      - name: Check architecture, storage, Docker, and OCI identity
+        env:
+          EXPECTED_OCI_REGION: ${{ vars.OCI_REGION }}
+          EXPECTED_OCI_NAMESPACE: ${{ vars.OCI_OBJECT_STORAGE_NAMESPACE }}
+          EXPECTED_OCI_BUCKET: ${{ vars.OCI_STAGING_BUCKET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]
+          [[ -r /etc/dq08-builder.env ]]
+          set -a
+          source /etc/dq08-builder.env
+          set +a
+          : "${ARMBIAN_CACHE_DIR:?}"
+          : "${OCI_REGION:?}"
+          : "${OCI_OBJECT_STORAGE_NAMESPACE:?}"
+          : "${OCI_STAGING_BUCKET:?}"
+          : "${EXPECTED_OCI_REGION:?Set the OCI_REGION repository variable}"
+          : "${EXPECTED_OCI_NAMESPACE:?Set the OCI_OBJECT_STORAGE_NAMESPACE repository variable}"
+          : "${EXPECTED_OCI_BUCKET:?Set the OCI_STAGING_BUCKET repository variable}"
+          [[ "${OCI_REGION}" == "${EXPECTED_OCI_REGION}" ]]
+          [[ "${OCI_OBJECT_STORAGE_NAMESPACE}" == "${EXPECTED_OCI_NAMESPACE}" ]]
+          [[ "${OCI_STAGING_BUCKET}" == "${EXPECTED_OCI_BUCKET}" ]]
+          mkdir -p "${ARMBIAN_CACHE_DIR}"
+          test -w "${ARMBIAN_CACHE_DIR}"
+          docker info >/dev/null
+          oci os bucket get \
+            --auth instance_principal \
+            --region "${OCI_REGION}" \
+            --namespace-name "${OCI_OBJECT_STORAGE_NAMESPACE}" \
+            --bucket-name "${OCI_STAGING_BUCKET}" \
+            --query data.name --raw-output >/dev/null
+          df -h "${ARMBIAN_CACHE_DIR}"

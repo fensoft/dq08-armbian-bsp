@@ -17,7 +17,7 @@ The module is pinned to Armbian's supported **current** kernel line, Linux
 | --- | --- |
 | Armbian build | 90fda43901b0127104227975ae62d35fbad05abc |
 | Linux | 6.18.39 at f89c296854b755a66657065c35b05406fc18264d |
-| U-Boot | v2026.04 |
+| U-Boot | v2026.04 at 88dc2788777babfd6322fa655df549a019aa1e69 |
 | Rockchip rkbin | f43a462e7a1429a9d407ae52b4745033034a6cf9 |
 | Source BSP | fensoft/dq08-haos at ebc35462a307fad483a7ea0f01b05cbc2b17d458 |
 
@@ -49,6 +49,8 @@ build.sh                       Install and build a minimal image
 verify.sh                      Check the module and an optional installation
 manifest.txt                   Exact list of managed userpatches files
 module.conf                    Tested versions and module metadata
+scripts/ci/                    Release discovery, build, and validation helpers
+infra/oci/                     OpenTofu stack for the ARM64 build runner
 ~~~
 
 The paths listed in manifest.txt are copied below
@@ -215,6 +217,18 @@ Expected SHA-256 values:
 f404365dd3929481052548c220aff3e82238bc7a679f13ab52e7e4e9ca1cfeb4  rk3528_ddr_1056MHz_4BIT_PCB_v1.10.bin
 3dde96556de969c92784e0f37b50a696bd457200353bbb611a91130b0ef960b9  rk3528_bl31_v1.18.elf
 ~~~
+
+## Automated stable releases
+
+The free release pipeline watches stable Armbian point tags, builds on a
+dedicated OCI A1 ARM64 runner, transfers through a private three-day Object
+Storage bucket, and validates and publishes from a GitHub-hosted runner. It
+pins the rolling Linux branch to one commit and refuses a new current kernel
+series until the DTS is ported and hardware-tested.
+
+Provisioning, GitHub configuration, rollout, security boundaries, immutable
+release behavior, and recovery are documented in
+[docs/release-pipeline.md](docs/release-pipeline.md).
 
 ## Put this module in its own Git repository
 

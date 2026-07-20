@@ -9,6 +9,60 @@ manifest="${module_root}/manifest.txt"
 errors=0
 file_count=0
 
+for commit_var in \
+	DQ08_TESTED_KERNEL_COMMIT \
+	DQ08_UBOOT_COMMIT \
+	DQ08_TESTED_ARMBIAN_COMMIT \
+	DQ08_SOURCE_BSP_COMMIT \
+	DQ08_RKBIN_COMMIT; do
+	commit_value="${!commit_var}"
+	if [[ ! "${commit_value}" =~ ^[0-9a-f]{40}$ ]]; then
+		printf 'Invalid %s: %s\n' "${commit_var}" "${commit_value}" >&2
+		errors=$((errors + 1))
+	fi
+done
+
+for checksum_var in DQ08_RKBIN_DDR_SHA256 DQ08_RKBIN_BL31_SHA256; do
+	checksum_value="${!checksum_var}"
+	if [[ ! "${checksum_value}" =~ ^[0-9a-f]{64}$ ]]; then
+		printf 'Invalid %s: %s\n' "${checksum_var}" "${checksum_value}" >&2
+		errors=$((errors + 1))
+	fi
+done
+
+[[ -n "${DQ08_MAINTAINER}" && -n "${DQ08_MAINTAINER_EMAIL}" ]] || {
+	printf 'Maintainer name and email must not be empty.\n' >&2
+	errors=$((errors + 1))
+}
+if printf '%s\n%s\n' "${DQ08_MAINTAINER}" "${DQ08_MAINTAINER_EMAIL}" | grep -Eqi \
+	'john[._ -]*doe|somewhere[.]on[.]planet|example[.](com|org|net)|(^|[^[:alnum:]])(todo|unknown)([^[:alnum:]]|$)'; then
+	printf 'Maintainer metadata contains a placeholder.\n' >&2
+	errors=$((errors + 1))
+fi
+
+if [[ ! "${DQ08_KERNEL_SERIES}" =~ ^[0-9]+[.][0-9]+$ || "${DQ08_TESTED_KERNEL}" != "${DQ08_KERNEL_SERIES}."* ]]; then
+	printf 'Tested kernel %s does not match series %s.\n' "${DQ08_TESTED_KERNEL}" "${DQ08_KERNEL_SERIES}" >&2
+	errors=$((errors + 1))
+fi
+
+extension_file="${module_root}/extensions/dq08-bsp/dq08-bsp.sh"
+for expected_assignment in \
+	"DQ08_RKBIN_COMMIT=\"${DQ08_RKBIN_COMMIT}\"" \
+	"DQ08_RKBIN_DDR_SHA256=\"${DQ08_RKBIN_DDR_SHA256}\"" \
+	"DQ08_RKBIN_BL31_SHA256=\"${DQ08_RKBIN_BL31_SHA256}\"" \
+	"DQ08_UBOOT_COMMIT=\"${DQ08_UBOOT_COMMIT}\""; do
+	if ! grep -Fq "${expected_assignment}" "${extension_file}"; then
+		printf 'Extension metadata mismatch: expected %s\n' "${expected_assignment}" >&2
+		errors=$((errors + 1))
+	fi
+done
+
+board_file="${module_root}/config/boards/vontar-dq08.csc"
+if ! grep -Fq "BOARD_MAINTAINER=\"${DQ08_MAINTAINER}\"" "${board_file}"; then
+	printf 'Board maintainer does not match module.conf.\n' >&2
+	errors=$((errors + 1))
+fi
+
 while read -r mode relative_path; do
 	[[ -n "${mode}" && "${mode}" != \#* ]] || continue
 	file="${module_root}/${relative_path}"

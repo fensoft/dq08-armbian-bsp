@@ -1,0 +1,28 @@
+# OCI provider authentication is intentionally not stored here. Configure the
+# standard ~/.oci/config profile, OCI_* environment variables, or OCI Resource
+# Manager before running OpenTofu.
+tenancy_ocid     = "ocid1.tenancy.oc1..replace_me"
+compartment_ocid = "ocid1.compartment.oc1..replace_me"
+# This must be the tenancy home region; the stack refuses any other region.
+region = "eu-frankfurt-1"
+
+# Restrict this to the public IP of the person administering the runner.
+admin_ssh_cidr = "203.0.113.42/32"
+ssh_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIReplaceWithARealPublicKey admin@example"
+
+github_repository = "fensoft/dq08-armbian-bsp"
+
+# OCI requires a fixed expiration. Rotate the PAR and GitHub secret before this
+# UTC timestamp; it must be in the future at apply time.
+staging_par_expiration = "2027-12-31T23:59:59Z"
+
+# Optional overrides:
+# availability_domain = "example:EU-FRANKFURT-1-AD-1"
+# ubuntu_image_ocid    = "ocid1.image.oc1.eu-frankfurt-1.replace_me"
+# staging_bucket_name  = "dq08-armbian-staging"
+# name_prefix          = "dq08-armbian"
+# vcn_cidr             = "10.42.0.0/16"
+# subnet_cidr          = "10.42.0.0/24"
+# freeform_tags = {
+#   Owner = "fensoft"
+# }

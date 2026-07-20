@@ -26,5 +26,7 @@ exec "${armbian_build}/compile.sh" build \
 	BUILD_MINIMAL=yes \
 	BUILD_DESKTOP=no \
 	KERNEL_CONFIGURE=no \
+	MAINTAINER="${DQ08_MAINTAINER}" \
+	MAINTAINERMAIL="${DQ08_MAINTAINER_EMAIL}" \
 	PREFER_DOCKER=yes \
 	"$@"

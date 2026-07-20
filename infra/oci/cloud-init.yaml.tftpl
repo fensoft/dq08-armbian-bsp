@@ -1,0 +1,250 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+timezone: UTC
+
+groups:
+  - docker
+
+users:
+  - default
+  - name: ${runner_user}
+    gecos: GitHub Actions runner
+    groups:
+      - docker
+    lock_passwd: true
+    shell: /bin/bash
+
+packages:
+  - binfmt-support
+  - build-essential
+  - ca-certificates
+  - curl
+  - docker.io
+  - e2fsprogs
+  - git
+  - git-lfs
+  - jq
+  - pigz
+  - python3
+  - python3-pip
+  - python3-venv
+  - qemu-user-static
+  - rsync
+  - tar
+  - unzip
+  - xz-utils
+  - zstd
+
+write_files:
+  - path: /etc/docker/daemon.json
+    owner: root:root
+    permissions: "0644"
+    content: |
+      {
+        "data-root": "${persistent_root}/docker",
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-file": "3",
+          "max-size": "25m"
+        }
+      }
+
+  - path: /etc/dq08-builder.env
+    owner: root:root
+    permissions: "0644"
+    content: |
+      OCI_CLI_AUTH=instance_principal
+      OCI_REGION=${region}
+      OCI_OBJECT_STORAGE_NAMESPACE=${object_storage_namespace}
+      OCI_STAGING_BUCKET=${staging_bucket_name}
+      GITHUB_REPOSITORY=${github_repository}
+      RUNNER_LABEL=${runner_label}
+      RUNNER_INSTALL_DIR=${runner_install_dir}
+      RUNNER_WORK_DIR=${runner_work_dir}
+      ARMBIAN_CACHE_DIR=${armbian_cache_dir}
+
+  - path: /etc/profile.d/dq08-builder.sh
+    owner: root:root
+    permissions: "0644"
+    content: |
+      set -a
+      . /etc/dq08-builder.env
+      set +a
+
+  - path: /usr/local/sbin/dq08-prepare-data-volume
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      readonly device="${data_volume_device}"
+      readonly mountpoint="${persistent_root}"
+
+      # Terraform can attach the volume only after the VM exists, so cloud-init
+      # may arrive here first. Fail safely rather than scanning and formatting an
+      # arbitrary disk.
+      for _attempt in $(seq 1 360); do
+        if [[ -b "$device" ]]; then
+          break
+        fi
+        sleep 5
+      done
+
+      if [[ ! -b "$device" ]]; then
+        echo "Persistent OCI data device $device did not appear within 30 minutes" >&2
+        exit 1
+      fi
+
+      filesystem_type="$(blkid -o value -s TYPE "$device" 2>/dev/null || true)"
+      if [[ -z "$filesystem_type" ]]; then
+        if [[ -n "$(wipefs --noheadings --output TYPE "$device" 2>/dev/null || true)" ]]; then
+          echo "Refusing to format $device because it has an unrecognized signature" >&2
+          exit 1
+        fi
+        mkfs.ext4 -F -L dq08-data "$device"
+        filesystem_type="ext4"
+      fi
+
+      if [[ "$filesystem_type" != "ext4" ]]; then
+        echo "Refusing to mount $device: expected ext4, found $filesystem_type" >&2
+        exit 1
+      fi
+
+      filesystem_uuid="$(blkid -o value -s UUID "$device")"
+      already_mounted=false
+      if findmnt -rn -M "$mountpoint" >/dev/null; then
+        already_mounted=true
+        mounted_uuid="$(findmnt -rn -M "$mountpoint" -o UUID)"
+        if [[ "$mounted_uuid" != "$filesystem_uuid" ]]; then
+          echo "Refusing to continue: $mountpoint contains UUID $mounted_uuid, expected $filesystem_uuid" >&2
+          exit 1
+        fi
+      else
+        # Keep the underlying boot-volume directory inaccessible. If this mount
+        # ever fails, an unprivileged runner cannot silently put _work/cache data
+        # on the boot disk. Never chmod this path while the data volume is mounted.
+        install -d -m 000 "$mountpoint"
+      fi
+      sed -i '\|[[:space:]]${persistent_root}[[:space:]]|d' /etc/fstab
+      # The service is the sole mounter; noauto prevents a generated mount unit
+      # from racing this UUID validation during boot.
+      printf 'UUID=%s %s ext4 defaults,noauto 0 2\n' \
+        "$filesystem_uuid" "$mountpoint" >> /etc/fstab
+
+      if [[ "$already_mounted" != true ]]; then
+        mount "$mountpoint"
+      fi
+      mounted_uuid="$(findmnt -rn -M "$mountpoint" -o UUID)"
+      if [[ "$mounted_uuid" != "$filesystem_uuid" ]]; then
+        echo "Refusing to continue: $mountpoint contains UUID $mounted_uuid, expected $filesystem_uuid" >&2
+        exit 1
+      fi
+      chmod 0755 "$mountpoint"
+
+      # Safe after a no-op on an unchanged filesystem; handles a later OCI
+      # volume expansion without reformatting it.
+      resize2fs "$device"
+
+      install -d -m 0711 "${persistent_root}/docker"
+      install -d -o ${runner_user} -g ${runner_user} -m 2775 "${persistent_root}/actions"
+      install -d -o ${runner_user} -g ${runner_user} -m 2775 "${runner_work_dir}"
+      install -d -o ${runner_user} -g ${runner_user} -m 2775 "${persistent_root}/armbian"
+      install -d -o ${runner_user} -g ${runner_user} -m 2775 "${armbian_cache_dir}"
+      install -d -o ${runner_user} -g ${runner_user} -m 0755 "${runner_install_dir}"
+
+  - path: /usr/local/sbin/dq08-install-runner-service
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      readonly runner_dir="${runner_install_dir}"
+      readonly runner_user="${runner_user}"
+      readonly mountpoint="${persistent_root}"
+
+      if [[ $EUID -ne 0 ]]; then
+        echo "Run this helper as root after config.sh has registered the runner" >&2
+        exit 1
+      fi
+      if [[ ! -x "$runner_dir/svc.sh" || ! -f "$runner_dir/.runner" ]]; then
+        echo "Register the runner with $runner_dir/config.sh before installing its service" >&2
+        exit 1
+      fi
+      if ! mountpoint -q "$mountpoint"; then
+        echo "$mountpoint is not mounted; refusing to install/start the runner" >&2
+        exit 1
+      fi
+
+      cd "$runner_dir"
+      mapfile -t candidates < <(
+        grep -lF "$runner_dir/runsvc.sh" /etc/systemd/system/actions.runner.*.service 2>/dev/null || true
+      )
+      if [[ $${#candidates[@]} -eq 0 ]]; then
+        ./svc.sh install "$runner_user"
+        mapfile -t candidates < <(
+          grep -lF "$runner_dir/runsvc.sh" /etc/systemd/system/actions.runner.*.service 2>/dev/null || true
+        )
+      fi
+      if [[ $${#candidates[@]} -ne 1 ]]; then
+        echo "Expected one runner service for $runner_dir, found $${#candidates[@]}" >&2
+        exit 1
+      fi
+
+      service_path="$${candidates[0]}"
+      service_name="$(basename "$service_path")"
+      dropin_dir="/etc/systemd/system/$service_name.d"
+      install -d -m 0755 "$dropin_dir"
+      cat > "$dropin_dir/dq08-data-volume.conf" <<'EOF'
+      [Unit]
+      Requires=dq08-data-volume.service
+      After=dq08-data-volume.service
+      ConditionPathIsMountPoint=${persistent_root}
+      EOF
+
+      systemctl daemon-reload
+      systemctl enable --now "$service_name"
+      systemctl --no-pager --full status "$service_name"
+
+  - path: /etc/systemd/system/dq08-data-volume.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Prepare the persistent DQ08 builder data volume
+      Wants=network-online.target
+      After=network-online.target
+      Before=docker.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/dq08-prepare-data-volume
+      RemainAfterExit=yes
+      TimeoutStartSec=1900
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/docker.service.d/dq08-data-volume.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Requires=dq08-data-volume.service
+      After=dq08-data-volume.service
+      ConditionPathIsMountPoint=${persistent_root}
+
+runcmd:
+  - [bash, -lc, "python3 -m venv /opt/oci-cli && /opt/oci-cli/bin/pip install --no-cache-dir --upgrade pip && /opt/oci-cli/bin/pip install --no-cache-dir oci-cli && ln -sfn /opt/oci-cli/bin/oci /usr/local/bin/oci"]
+  - [systemctl, daemon-reload]
+  - [systemctl, stop, docker.service]
+  - [systemctl, stop, docker.socket]
+  - [systemctl, enable, dq08-data-volume.service]
+  - [systemctl, restart, dq08-data-volume.service]
+  - [systemctl, enable, --now, docker.service]
+  - [git, lfs, install, --system]
+  - [bash, -lc, "docker info && oci --version"]
+
+final_message: "DQ08 builder base provisioning completed after $UPTIME seconds; register the repository runner manually."

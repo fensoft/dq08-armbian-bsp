@@ -3,6 +3,9 @@
 
 # Match the exact public Rockchip binaries pinned by fensoft/dq08-haos.
 declare -g DQ08_RKBIN_COMMIT="f43a462e7a1429a9d407ae52b4745033034a6cf9"
+declare -g DQ08_RKBIN_DDR_SHA256="f404365dd3929481052548c220aff3e82238bc7a679f13ab52e7e4e9ca1cfeb4"
+declare -g DQ08_RKBIN_BL31_SHA256="3dde96556de969c92784e0f37b50a696bd457200353bbb611a91130b0ef960b9"
+declare -g DQ08_UBOOT_COMMIT="88dc2788777babfd6322fa655df549a019aa1e69"
 declare -g DQ08_RKBIN_DIR="${SRC}/cache/sources/vontar-dq08-rkbin"
 declare -g DDR_BLOB="bin/rk35/rk3528_ddr_1056MHz_4BIT_PCB_v1.10.bin"
 declare -g BL31_BLOB="bin/rk35/rk3528_bl31_v1.18.elf"
@@ -10,12 +13,18 @@ declare -g UBOOT_HASH_EXTRA="vontar-dq08-rkbin-${DQ08_RKBIN_COMMIT}"
 
 function fetch_sources_tools__vontar_dq08_rkbin() {
 	fetch_from_repo "https://github.com/rockchip-linux/rkbin.git" "vontar-dq08-rkbin" "commit:${DQ08_RKBIN_COMMIT}"
+
+	local ddr_sha256 bl31_sha256
+	ddr_sha256="$(sha256sum "${DQ08_RKBIN_DIR}/${DDR_BLOB}" | awk '{print $1}')"
+	bl31_sha256="$(sha256sum "${DQ08_RKBIN_DIR}/${BL31_BLOB}" | awk '{print $1}')"
+	[[ "${ddr_sha256}" == "${DQ08_RKBIN_DDR_SHA256}" ]] || exit_with_error "DQ08 DDR blob checksum mismatch" "${DDR_BLOB}"
+	[[ "${bl31_sha256}" == "${DQ08_RKBIN_BL31_SHA256}" ]] || exit_with_error "DQ08 BL31 blob checksum mismatch" "${BL31_BLOB}"
 }
 
 function post_family_config__vontar_dq08_mainline_uboot() {
 	display_alert "$BOARD" "Using upstream U-Boot v2026.04" "info"
 	declare -g BOOTSOURCE="https://github.com/u-boot/u-boot.git"
-	declare -g BOOTBRANCH="tag:v2026.04"
+	declare -g BOOTBRANCH="commit:${DQ08_UBOOT_COMMIT}"
 	declare -g BOOTPATCHDIR="v2026.04"
 	declare -g UBOOT_TARGET_MAP="BL31=${DQ08_RKBIN_DIR}/${BL31_BLOB} ROCKCHIP_TPL=${DQ08_RKBIN_DIR}/${DDR_BLOB};;u-boot-rockchip.bin"
 }

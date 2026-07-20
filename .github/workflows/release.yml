@@ -1,0 +1,687 @@
+name: DQ08 Armbian Release
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      armbian_tag:
+        description: Exact stable Armbian tag; blank selects the oldest unpublished tag
+        required: false
+        type: string
+      dry_run:
+        description: Build, stage, and validate without publishing; immutable tag state is still recorded
+        required: true
+        default: true
+        type: boolean
+      max_attempts:
+        description: Maximum attempts for transient fetch and build operations
+        required: true
+        default: "3"
+        type: choice
+        options:
+          - "3"
+          - "2"
+          - "1"
+
+permissions: {}
+
+concurrency:
+  group: dq08-armbian-release
+  cancel-in-progress: false
+
+jobs:
+  control:
+    name: Hosted discovery and preflight
+    if: github.event_name == 'workflow_dispatch' || vars.DQ08_RELEASE_SCHEDULE_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      status: ${{ steps.expose.outputs.status }}
+      armbian_tag: ${{ steps.expose.outputs.armbian_tag }}
+      armbian_commit: ${{ steps.expose.outputs.armbian_commit }}
+      release_name: ${{ steps.expose.outputs.release_name }}
+      dry_run: ${{ steps.expose.outputs.dry_run }}
+      max_attempts: ${{ steps.expose.outputs.max_attempts }}
+      state_changed: ${{ steps.expose.outputs.state_changed }}
+      already_published: ${{ steps.expose.outputs.already_published }}
+      runner_ready: ${{ steps.expose.outputs.runner_ready }}
+      expected_kernel_series: ${{ steps.expose.outputs.expected_kernel_series }}
+      actual_kernel_series: ${{ steps.expose.outputs.actual_kernel_series }}
+    steps:
+      - name: Check out BSP
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Collect upstream tags, releases, and immutable state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .api .control
+
+          gh api --paginate --slurp "repos/armbian/build/tags?per_page=100" \
+            | jq '[.[][] | {name: .name, commit: .commit.sha}]' > .api/tags.json
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            | jq '[.[][] | {tag_name: .tag_name, name: .name, draft: .draft, prerelease: .prerelease, assets: [.assets[].name]}]' \
+            > .api/releases.json
+
+          state_error="${RUNNER_TEMP}/state-error.txt"
+          if gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/${GITHUB_REPOSITORY}/contents/automation/state.json?ref=automation-state" \
+            > .api/state.json 2>"${state_error}"; then
+            jq -e '.schema_version == 1 and (.armbian_tags | type == "object")' .api/state.json >/dev/null
+          elif grep -q 'HTTP 404' "${state_error}"; then
+            printf '%s\n' '{"schema_version":1,"armbian_tags":{}}' > .api/state.json
+          else
+            cat "${state_error}" >&2
+            exit 1
+          fi
+
+      - name: Select oldest missing stable release
+        env:
+          REQUESTED_TAG: ${{ inputs.armbian_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          declare -a requested=()
+          if [[ -n "${REQUESTED_TAG:-}" ]]; then
+            requested=(--requested-tag "${REQUESTED_TAG}")
+          fi
+          python3 scripts/ci/discover_release.py \
+            --tags-json .api/tags.json \
+            --releases-json .api/releases.json \
+            --state-json .api/state.json \
+            --module-conf module.conf \
+            --baseline v26.5.1 \
+            "${requested[@]}" \
+            --output .control/selection.json \
+            --next-state .control/next-state.json
+
+      - name: Read selection
+        id: selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq . .control/selection.json
+          printf 'status=%s\n' "$(jq -r .status .control/selection.json)" >> "${GITHUB_OUTPUT}"
+          printf 'armbian_tag=%s\n' "$(jq -r '.armbian_tag // ""' .control/selection.json)" >> "${GITHUB_OUTPUT}"
+          printf 'armbian_commit=%s\n' "$(jq -r '.armbian_commit // ""' .control/selection.json)" >> "${GITHUB_OUTPUT}"
+
+      - name: Check out selected Armbian commit
+        if: steps.selection.outputs.status == 'selected'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: armbian/build
+          ref: ${{ steps.selection.outputs.armbian_commit }}
+          path: .ci/armbian-build
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify compatibility and pin the rolling kernel
+        if: steps.selection.outputs.status == 'selected'
+        id: preflight
+        env:
+          FETCH_ATTEMPTS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_attempts || '3' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${FETCH_ATTEMPTS}" =~ ^[123]$ ]]
+          set +e
+          python3 scripts/ci/preflight.py \
+            --bsp-root . \
+            --armbian-root .ci/armbian-build \
+            --armbian-tag "${{ steps.selection.outputs.armbian_tag }}" \
+            --armbian-commit "${{ steps.selection.outputs.armbian_commit }}" \
+            --fetch-attempts "${FETCH_ATTEMPTS}" \
+            --output .control/preflight.json
+          result=$?
+          set -e
+          if ((result == 3)); then
+            printf 'Kernel port required; compilation will not be scheduled.\n'
+            exit 0
+          fi
+          exit "${result}"
+
+      - name: Gate on a recent healthy builder
+        if: steps.selection.outputs.status == 'selected' && steps.preflight.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAX_AGE_MINUTES: ${{ vars.DQ08_BUILDER_HEALTH_MAX_AGE_MINUTES || '180' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(jq -r .status .control/preflight.json)" != ready ]]; then
+            exit 0
+          fi
+          [[ "${MAX_AGE_MINUTES}" =~ ^[0-9]+$ ]] && ((MAX_AGE_MINUTES >= 10))
+          gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/builder-health.yml/runs" \
+            -f per_page=20 > .api/builder-runs.json
+          latest_status="$(jq -r '.workflow_runs[0].status // empty' .api/builder-runs.json)"
+          latest_conclusion="$(jq -r '.workflow_runs[0].conclusion // empty' .api/builder-runs.json)"
+          last_success=""
+          if [[ "${latest_status}" == completed && "${latest_conclusion}" == success ]]; then
+            last_success="$(jq -r '.workflow_runs[0].updated_at' .api/builder-runs.json)"
+          fi
+          ready=false
+          age_minutes=null
+          if [[ -n "${last_success}" ]]; then
+            now_epoch="$(date --utc +%s)"
+            health_epoch="$(date --utc --date "${last_success}" +%s)"
+            age_minutes=$(((now_epoch - health_epoch) / 60))
+            if ((age_minutes >= 0 && age_minutes <= MAX_AGE_MINUTES)); then
+              ready=true
+            fi
+          fi
+          jq -n \
+            --argjson ready "${ready}" \
+            --arg latest_status "${latest_status}" \
+            --arg latest_conclusion "${latest_conclusion}" \
+            --arg last_success "${last_success}" \
+            --argjson age_minutes "${age_minutes}" \
+            --argjson max_age_minutes "${MAX_AGE_MINUTES}" \
+            '{ready:$ready,latest_status:$latest_status,latest_conclusion:$latest_conclusion,last_success:$last_success,age_minutes:$age_minutes,max_age_minutes:$max_age_minutes}' \
+            > .control/runner-health.json
+          jq . .control/runner-health.json
+
+      - name: Expose control decision
+        if: always()
+        id: expose
+        env:
+          DISPATCH_DRY_RUN: ${{ inputs.dry_run }}
+          DISPATCH_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=error
+          if [[ -f .control/preflight.json ]]; then
+            status="$(jq -r .status .control/preflight.json)"
+          elif [[ -f .control/selection.json ]]; then
+            status="$(jq -r .status .control/selection.json)"
+          fi
+          if [[ "${GITHUB_EVENT_NAME}" == workflow_dispatch ]]; then
+            dry_run="${DISPATCH_DRY_RUN}"
+            max_attempts="${DISPATCH_MAX_ATTEMPTS}"
+          else
+            dry_run=false
+            max_attempts=3
+          fi
+          runner_ready=false
+          if [[ -f .control/runner-health.json ]]; then
+            runner_ready="$(jq -r .ready .control/runner-health.json)"
+          fi
+          armbian_tag="$(jq -r '.armbian_tag // ""' .control/selection.json 2>/dev/null || true)"
+          armbian_commit="$(jq -r '.armbian_commit // ""' .control/selection.json 2>/dev/null || true)"
+          release_name="$(jq -r '.release_name // ""' .control/selection.json 2>/dev/null || true)"
+          expected_series=""
+          actual_series=""
+          if [[ -f .control/preflight.json ]]; then
+            expected_series="$(jq -r '.expected_kernel_series // ""' .control/preflight.json)"
+            actual_series="$(jq -r '.actual_kernel_series // ""' .control/preflight.json)"
+          fi
+          {
+            printf 'status=%s\n' "${status}"
+            printf 'armbian_tag=%s\n' "${armbian_tag}"
+            printf 'armbian_commit=%s\n' "${armbian_commit}"
+            printf 'release_name=%s\n' "${release_name}"
+            printf 'dry_run=%s\n' "${dry_run}"
+            printf 'max_attempts=%s\n' "${max_attempts}"
+            printf 'state_changed=%s\n' "$(jq -r '.state_changed // false' .control/selection.json 2>/dev/null || printf false)"
+            printf 'already_published=%s\n' "$(jq -r '.already_published // false' .control/selection.json 2>/dev/null || printf false)"
+            printf 'runner_ready=%s\n' "${runner_ready}"
+            printf 'expected_kernel_series=%s\n' "${expected_series}"
+            printf 'actual_kernel_series=%s\n' "${actual_series}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Upload trusted control bundle
+        if: always() && hashFiles('.control/selection.json') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dq08-release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .control/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 3
+
+  lock-state:
+    name: Lock immutable upstream tag mapping
+    needs: control
+    if: >-
+      always() &&
+      needs.control.result == 'success' &&
+      needs.control.outputs.state_changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out state writer
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Download hosted control bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: dq08-release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dq08-control
+      - name: Record every observed stable tag and commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./.github/scripts/put_branch_file.sh \
+            automation-state automation/state.json \
+            "${RUNNER_TEMP}/dq08-control/next-state.json" \
+            "chore(automation): lock observed Armbian tags"
+
+  build:
+    name: Privileged ARM64 image build
+    needs: [control, lock-state]
+    if: >-
+      always() &&
+      needs.control.result == 'success' &&
+      needs.control.outputs.status == 'ready' &&
+      needs.control.outputs.runner_ready == 'true' &&
+      (needs['lock-state'].result == 'success' || needs['lock-state'].result == 'skipped')
+    runs-on: [self-hosted, Linux, ARM64, dq08-builder]
+    timeout-minutes: 720
+    permissions:
+      actions: read
+    env:
+      MAX_ATTEMPTS: ${{ needs.control.outputs.max_attempts }}
+      STAGING_OBJECT: dq08/${{ github.repository_id }}/${{ needs.control.outputs.release_name }}/release.tar
+    steps:
+      - name: Download hosted control bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: dq08-release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dq08-control
+
+      - name: Fetch exact public source revisions without a repository token
+        env:
+          BSP_COMMIT: ${{ github.sha }}
+          ARMBIAN_COMMIT: ${{ needs.control.outputs.armbian_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${BSP_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${ARMBIAN_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${MAX_ATTEMPTS}" =~ ^[123]$ ]]
+          bsp_root="${RUNNER_TEMP}/dq08-bsp"
+          armbian_root="${RUNNER_TEMP}/armbian-build"
+          mkdir -p "${bsp_root}" "${armbian_root}"
+
+          git -C "${bsp_root}" init
+          git -C "${bsp_root}" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "${armbian_root}" init
+          git -C "${armbian_root}" remote add origin https://github.com/armbian/build.git
+
+          fetch_exact() {
+            local directory="$1" commit="$2" attempt
+            for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
+              if git -C "${directory}" fetch --no-tags --depth=1 origin "${commit}"; then
+                git -C "${directory}" checkout --detach FETCH_HEAD
+                [[ "$(git -C "${directory}" rev-parse HEAD)" == "${commit}" ]]
+                return 0
+              fi
+              ((attempt == MAX_ATTEMPTS)) || sleep $((attempt * 10))
+            done
+            return 1
+          }
+          fetch_exact "${bsp_root}" "${BSP_COMMIT}"
+          fetch_exact "${armbian_root}" "${ARMBIAN_COMMIT}"
+
+          set -a
+          source /etc/dq08-builder.env
+          set +a
+          : "${ARMBIAN_CACHE_DIR:?}"
+          mkdir -p "${ARMBIAN_CACHE_DIR}"
+          [[ ! -e "${armbian_root}/cache" ]]
+          ln -s "${ARMBIAN_CACHE_DIR}" "${armbian_root}/cache"
+          printf 'bsp_root=%s\narmbian_root=%s\n' "${bsp_root}" "${armbian_root}" >> "${GITHUB_ENV}"
+
+      - name: Build and create four-file release stage
+        id: build
+        env:
+          CONTROL_DIR: ${{ runner.temp }}/dq08-control
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage_dir="${RUNNER_TEMP}/dq08-stage"
+          python3 "${bsp_root}/scripts/ci/build_release.py" \
+            --bsp-root "${bsp_root}" \
+            --armbian-root "${armbian_root}" \
+            --preflight "${CONTROL_DIR}/preflight.json" \
+            --stage-dir "${stage_dir}" \
+            --workflow-run-id "${GITHUB_RUN_ID}" \
+            --workflow-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --workflow-run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --build-attempts "${MAX_ATTEMPTS}" \
+            --output "${RUNNER_TEMP}/build-result.json"
+          jq . "${RUNNER_TEMP}/build-result.json"
+          printf 'stage_dir=%s\n' "${stage_dir}" >> "${GITHUB_OUTPUT}"
+
+      - name: Package and upload through the OCI instance principal
+        env:
+          STAGE_DIR: ${{ steps.build.outputs.stage_dir }}
+          EXPECTED_OCI_REGION: ${{ vars.OCI_REGION }}
+          EXPECTED_OCI_NAMESPACE: ${{ vars.OCI_OBJECT_STORAGE_NAMESPACE }}
+          EXPECTED_OCI_BUCKET: ${{ vars.OCI_STAGING_BUCKET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          source /etc/dq08-builder.env
+          set +a
+          : "${OCI_REGION:?}"
+          : "${OCI_OBJECT_STORAGE_NAMESPACE:?}"
+          : "${OCI_STAGING_BUCKET:?}"
+          : "${EXPECTED_OCI_REGION:?}"
+          : "${EXPECTED_OCI_NAMESPACE:?}"
+          : "${EXPECTED_OCI_BUCKET:?}"
+          [[ "${OCI_REGION}" == "${EXPECTED_OCI_REGION}" ]]
+          [[ "${OCI_OBJECT_STORAGE_NAMESPACE}" == "${EXPECTED_OCI_NAMESPACE}" ]]
+          [[ "${OCI_STAGING_BUCKET}" == "${EXPECTED_OCI_BUCKET}" ]]
+
+          mapfile -t files < <(find "${STAGE_DIR}" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+          ((${#files[@]} == 4))
+          [[ " ${files[*]} " == *" build-manifest.json "* ]]
+          archive="${RUNNER_TEMP}/dq08-release.tar"
+          tar --create --file "${archive}" --directory "${STAGE_DIR}" -- "${files[@]}"
+
+          uploaded=false
+          for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
+            if oci os object put \
+              --auth instance_principal \
+              --region "${OCI_REGION}" \
+              --namespace-name "${OCI_OBJECT_STORAGE_NAMESPACE}" \
+              --bucket-name "${OCI_STAGING_BUCKET}" \
+              --name "${STAGING_OBJECT}" \
+              --file "${archive}" \
+              --force >/dev/null; then
+              uploaded=true
+              break
+            fi
+            ((attempt == MAX_ATTEMPTS)) || sleep $((attempt * 10))
+          done
+          [[ "${uploaded}" == true ]]
+          printf 'Uploaded private staging object %s (%s bytes).\n' "${STAGING_OBJECT}" "$(stat -c %s "${archive}")"
+
+  publish:
+    name: Hosted validation and immutable publication
+    needs: [control, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: release
+    permissions:
+      actions: read
+      contents: write
+    env:
+      RELEASE_NAME: ${{ needs.control.outputs.release_name }}
+      DRY_RUN: ${{ needs.control.outputs.dry_run }}
+      STAGING_OBJECT: dq08/${{ github.repository_id }}/${{ needs.control.outputs.release_name }}/release.tar
+    steps:
+      - name: Check out trusted publisher and validators
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Download hosted control bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: dq08-release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dq08-control
+
+      - name: Download private OCI staging object through read-only PAR
+        env:
+          OCI_STAGING_PAR_URL: ${{ secrets.OCI_STAGING_PAR_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${OCI_STAGING_PAR_URL}" == https://*/o/ ]]
+          encoded_object="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${STAGING_OBJECT}")"
+          curl --fail --silent --show-error --location \
+            --retry 3 --retry-all-errors \
+            --max-filesize 2200000000 \
+            --output "${RUNNER_TEMP}/dq08-release.tar" \
+            "${OCI_STAGING_PAR_URL}${encoded_object}"
+
+      - name: Safely extract and inspect staged files
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage_dir="${RUNNER_TEMP}/dq08-release"
+          python3 .github/scripts/safe_extract_release.py \
+            "${RUNNER_TEMP}/dq08-release.tar" "${stage_dir}"
+          printf 'stage_dir=%s\n' "${stage_dir}" >> "${GITHUB_ENV}"
+
+      - name: Download an existing immutable release, if present
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            | jq --arg release "${RELEASE_NAME}" \
+              '[.[][] | select(.tag_name == $release)]' \
+            > "${RUNNER_TEMP}/matching-releases.json"
+          match_count="$(jq -r length "${RUNNER_TEMP}/matching-releases.json")"
+          ((match_count <= 1))
+          if ((match_count == 1)); then
+            jq '.[0]' "${RUNNER_TEMP}/matching-releases.json" \
+              > "${RUNNER_TEMP}/existing-release.json"
+            jq -e --arg release "${RELEASE_NAME}" --arg target "${GITHUB_SHA}" \
+              '.tag_name == $release and .name == $release and .target_commitish == $target and .prerelease == false' \
+              "${RUNNER_TEMP}/existing-release.json" >/dev/null
+            if [[ "$(jq -r .draft "${RUNNER_TEMP}/existing-release.json")" == true ]]; then
+              draft_dir="${RUNNER_TEMP}/dq08-existing-draft"
+              ./.github/scripts/download_release_assets.sh \
+                "${RUNNER_TEMP}/existing-release.json" "${draft_dir}"
+              printf 'directory=\ndraft=true\ndraft_directory=%s\n' "${draft_dir}" >> "${GITHUB_OUTPUT}"
+            else
+              jq -e '.assets | length == 4' "${RUNNER_TEMP}/existing-release.json" >/dev/null
+              existing_dir="${RUNNER_TEMP}/dq08-existing-release"
+              ./.github/scripts/download_release_assets.sh \
+                "${RUNNER_TEMP}/existing-release.json" "${existing_dir}"
+              printf 'directory=%s\ndraft=false\ndraft_directory=\n' "${existing_dir}" >> "${GITHUB_OUTPUT}"
+            fi
+          else
+            printf 'directory=\ndraft=false\ndraft_directory=\n' >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Validate checksums, metadata, provenance, size, and idempotency
+        id: validate
+        env:
+          EXISTING_DIR: ${{ steps.existing.outputs.directory }}
+          DRAFT_DIR: ${{ steps.existing.outputs.draft_directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          declare -a existing=()
+          if [[ -n "${EXISTING_DIR}" ]]; then
+            existing=(--existing-release-dir "${EXISTING_DIR}")
+          elif [[ -n "${DRAFT_DIR}" ]]; then
+            existing=(--existing-draft-dir "${DRAFT_DIR}")
+          fi
+          python3 scripts/ci/validate_release.py \
+            --stage-dir "${stage_dir}" \
+            --module-conf module.conf \
+            --expected-preflight "${RUNNER_TEMP}/dq08-control/preflight.json" \
+            "${existing[@]}" \
+            --output "${RUNNER_TEMP}/validation.json"
+          jq . "${RUNNER_TEMP}/validation.json"
+          printf 'status=%s\n' "$(jq -r .status "${RUNNER_TEMP}/validation.json")" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish a new immutable GitHub Release
+        if: env.DRY_RUN != 'true' && steps.validate.outputs.status != 'already_published'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXISTING_DRAFT: ${{ steps.existing.outputs.draft }}
+          DRAFT_DIR: ${{ steps.existing.outputs.draft_directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(jq -r .release_name "${stage_dir}/build-manifest.json")" == "${RELEASE_NAME}" ]]
+          image="$(jq -r .image.filename "${stage_dir}/build-manifest.json")"
+          checksum="$(jq -r .image.checksum_filename "${stage_dir}/build-manifest.json")"
+          metadata="$(jq -r .image.metadata_filename "${stage_dir}/build-manifest.json")"
+          for file in "${image}" "${checksum}" "${metadata}" build-manifest.json; do
+            [[ -f "${stage_dir}/${file}" ]]
+          done
+          notes="${RUNNER_TEMP}/release-notes.md"
+          cat > "${notes}" <<EOF
+          Automatically built minimal Debian Bookworm image for the Vontar DQ08.
+
+          Armbian: ${{ needs.control.outputs.armbian_tag }} (${{ needs.control.outputs.armbian_commit }})
+
+          **Hardware tested: no.** Validate this image on a physical DQ08 before relying on it.
+          EOF
+          declare -a asset_paths=(
+            "${stage_dir}/${image}"
+            "${stage_dir}/${checksum}"
+            "${stage_dir}/${metadata}"
+            "${stage_dir}/build-manifest.json"
+          )
+          if [[ "${EXISTING_DRAFT}" == true ]]; then
+            declare -a missing_assets=()
+            for asset_path in "${asset_paths[@]}"; do
+              asset_name="$(basename "${asset_path}")"
+              if [[ -f "${DRAFT_DIR}/${asset_name}" ]]; then
+                if [[ "${asset_name}" != build-manifest.json ]]; then
+                  cmp "${DRAFT_DIR}/${asset_name}" "${asset_path}"
+                fi
+              else
+                missing_assets+=("${asset_path}")
+              fi
+            done
+            if ((${#missing_assets[@]})); then
+              gh release upload "${RELEASE_NAME}" "${missing_assets[@]}"
+            fi
+            gh release edit "${RELEASE_NAME}" \
+              --title "${RELEASE_NAME}" --notes-file "${notes}"
+          else
+            gh release create "${RELEASE_NAME}" "${asset_paths[@]}" \
+              --draft \
+              --target "${GITHUB_SHA}" \
+              --title "${RELEASE_NAME}" \
+              --notes-file "${notes}"
+          fi
+
+          find "${stage_dir}" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' \
+            | LC_ALL=C sort > "${RUNNER_TEMP}/expected-assets.txt"
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            | jq --arg release "${RELEASE_NAME}" \
+              '[.[][] | select(.tag_name == $release)]' \
+            > "${RUNNER_TEMP}/post-upload-matches.json"
+          jq -e --arg release "${RELEASE_NAME}" --arg target "${GITHUB_SHA}" \
+            'length == 1 and .[0].tag_name == $release and .[0].name == $release and .[0].target_commitish == $target and .[0].draft == true and .[0].prerelease == false and (.[0].assets | length == 4)' \
+            "${RUNNER_TEMP}/post-upload-matches.json" >/dev/null
+          jq '.[0]' "${RUNNER_TEMP}/post-upload-matches.json" \
+            > "${RUNNER_TEMP}/post-upload-release.json"
+          jq -r '.assets[].name' "${RUNNER_TEMP}/post-upload-release.json" \
+            | LC_ALL=C sort > "${RUNNER_TEMP}/actual-assets.txt"
+          cmp "${RUNNER_TEMP}/expected-assets.txt" "${RUNNER_TEMP}/actual-assets.txt"
+          remote_dir="${RUNNER_TEMP}/dq08-post-upload"
+          ./.github/scripts/download_release_assets.sh \
+            "${RUNNER_TEMP}/post-upload-release.json" "${remote_dir}"
+          python3 scripts/ci/validate_release.py \
+            --stage-dir "${stage_dir}" \
+            --module-conf module.conf \
+            --expected-preflight "${RUNNER_TEMP}/dq08-control/preflight.json" \
+            --existing-release-dir "${remote_dir}" \
+            --output "${RUNNER_TEMP}/post-upload-validation.json"
+          jq -e '.status == "already_published" and .should_publish == false' \
+            "${RUNNER_TEMP}/post-upload-validation.json" >/dev/null
+          gh release edit "${RELEASE_NAME}" --draft=false
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_NAME}" \
+            | jq -e --arg release "${RELEASE_NAME}" --arg target "${GITHUB_SHA}" \
+              '.tag_name == $release and .target_commitish == $target and .draft == false and .prerelease == false and (.assets | length == 4)' \
+              >/dev/null
+
+      - name: Report successful dry run
+        if: env.DRY_RUN == 'true'
+        shell: bash
+        run: |
+          printf 'Dry run complete for %s; no GitHub Release was written. The immutable tag mapping was recorded before the build.\n' "${RELEASE_NAME}"
+
+  report:
+    name: Deduplicated failure reporting
+    needs: [control, lock-state, build, publish]
+    if: always() && (github.event_name == 'workflow_dispatch' || vars.DQ08_RELEASE_SCHEDULE_ENABLED == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out issue helper
+        if: needs.control.result != 'skipped'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Open or update actionable issue
+        if: needs.control.result != 'skipped'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_RESULT: ${{ needs.control.result }}
+          CONTROL_STATUS: ${{ needs.control.outputs.status }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          STATE_RESULT: ${{ needs['lock-state'].result }}
+          ARMBIAN_TAG: ${{ needs.control.outputs.armbian_tag }}
+          RUNNER_READY: ${{ needs.control.outputs.runner_ready }}
+          EXPECTED_SERIES: ${{ needs.control.outputs.expected_kernel_series }}
+          ACTUAL_SERIES: ${{ needs.control.outputs.actual_kernel_series }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          key= title= label=automation-failure detail=
+          if [[ "${CONTROL_RESULT}" == failure || "${CONTROL_RESULT}" == cancelled ]]; then
+            key=controller
+            title='DQ08 release controller failed'
+            detail='Discovery, moved-tag validation, or hosted preflight failed.'
+          elif [[ "${CONTROL_STATUS}" == kernel_port_required ]]; then
+            key="kernel-port-required-${ACTUAL_SERIES:-unknown}"
+            title="kernel-port-required: Armbian ${ARMBIAN_TAG} uses Linux ${ACTUAL_SERIES:-unknown}"
+            label=kernel-port-required
+            detail="The BSP targets Linux ${EXPECTED_SERIES}; Armbian rockchip64/current is ${ACTUAL_SERIES}. Publication was refused. Follow the port and hardware-test procedure in README.full.md."
+          elif [[ "${STATE_RESULT}" == failure || "${STATE_RESULT}" == cancelled ]]; then
+            key=automation-state
+            title='DQ08 automation state update failed'
+            detail='The immutable Armbian tag mapping could not be committed to automation-state, so no privileged build was queued.'
+          elif [[ "${CONTROL_STATUS}" == ready && "${RUNNER_READY}" != true ]]; then
+            key=runner-offline
+            title='DQ08 ARM64 builder is unavailable'
+            label=runner-offline
+            detail='No successful builder-health run was recent enough, so the privileged job was not queued.'
+          elif [[ "${BUILD_RESULT}" == failure || "${BUILD_RESULT}" == cancelled ]]; then
+            key="release-${ARMBIAN_TAG:-unknown}"
+            title="DQ08 build failed for ${ARMBIAN_TAG:-unknown}"
+            detail='Transient fetch/build/upload attempts were exhausted on the ARM64 builder.'
+          elif [[ "${PUBLISH_RESULT}" == failure || "${PUBLISH_RESULT}" == cancelled ]]; then
+            key="release-${ARMBIAN_TAG:-unknown}"
+            title="DQ08 validation or publication failed for ${ARMBIAN_TAG:-unknown}"
+            detail='Hosted validation rejected the bundle, immutable-release comparison conflicted, or GitHub publication failed.'
+          else
+            exit 0
+          fi
+
+          body="${RUNNER_TEMP}/issue-body.md"
+          {
+            printf '%s\n\n' "${detail}"
+            printf 'Workflow run: %s/%s/actions/runs/%s\n' "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}"
+          } > "${body}"
+          ./.github/scripts/upsert_issue.sh "${key}" "${title}" "${label}" "${body}"
