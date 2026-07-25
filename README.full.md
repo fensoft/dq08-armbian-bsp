@@ -19,13 +19,40 @@ The module is pinned to Armbian's supported **current** kernel line, Linux
 | Linux | 6.18.39 at f89c296854b755a66657065c35b05406fc18264d |
 | U-Boot | v2026.04 at 88dc2788777babfd6322fa655df549a019aa1e69 |
 | Rockchip rkbin | f43a462e7a1429a9d407ae52b4745033034a6cf9 |
+| HK2735M firmware | LibreELEC/brcmfmac_sdio-firmware at 5987820e4ff88a5626536f66257165fe3a781b73 |
 | Source BSP | fensoft/dq08-haos at ebc35462a307fad483a7ea0f01b05cbc2b17d458 |
 
-The device tree covers eMMC, microSD, Ethernet, USB, RTL8822CS Wi-Fi/Bluetooth,
-infrared input, the power LED, serial console, and the I2C front panel. The
-board is deliberately marked headless: upstream Linux 6.18 does not provide
-the old vendor multimedia stack used by the legacy BSP, so HDMI, audio, VPU,
-and GPU acceleration are outside this module's supported scope.
+The device tree covers eMMC, microSD, Ethernet, USB, HK2735M/BCM4335
+Wi-Fi/Bluetooth, infrared input, the power LED, serial console, and the I2C
+front panel. The target unit's radio identity was confirmed from Linux sysfs:
+SDIO vendor `0x02d0`, device `0x4335`. The earlier RTL8822CS assumption came
+from a vendor reference device tree and does not describe this HK2735M PCB
+variant.
+
+The BSP selects the upstream `brcmfmac` SDIO driver and Broadcom HCI UART
+support. It retains the lean `armbian-firmware` package, avoiding the roughly
+2.2 GiB installed generic firmware bundle. During every build it fetches the
+exact LibreELEC firmware commit listed above, verifies SHA-256 before use, and
+installs `brcmfmac4335-sdio.bin`, its matching NVRAM text, and BCM4335 A0/B0/C0
+Bluetooth HCD files. Board-specific `vontar,dq08` firmware links point at the
+same verified Wi-Fi payload. The Broadcom binary license is included alongside
+the firmware. The final-image hook verifies the files, hashes, links, and
+required kernel modules; this is software validation, not evidence that a newly
+rebuilt image has passed a hardware radio test.
+
+The boot partition is 256 MiB; the corrected software-validated build uses
+about 111 MB of its 224 MiB formatted capacity. The board is deliberately
+marked headless: upstream Linux 6.18
+does not provide the old vendor multimedia stack used by the legacy BSP, so
+HDMI, audio, VPU, and GPU acceleration are outside this module's supported
+scope.
+
+With Bookworm, Linux 6.18.39, and XZ level 1, the validated lean-firmware build
+has a 1,292 MiB root filesystem, a 2,134,900,736-byte (2,036 MiB) raw image,
+and a 418,049,940-byte (398.69 MiB) compressed image. Its compressed SHA-256 is
+`70a066f86871fba3e51cf09c951241847aac248fc9cd594e4d50ddb86ee49a7b`.
+The earlier full-firmware build required a 4,676 MiB raw image and compressed
+to 1,211,780,036 bytes.
 
 ## Repository layout
 
@@ -193,18 +220,118 @@ Inspect the generated image and checksum:
 
 ~~~
 cd armbian-build/output/images
-sha256sum -c *.img.sha
-fdisk -l *.img
+sha256sum -c *.img.xz.sha
+xz -t *.img.xz
+xz --robot --list *.img.xz
 ~~~
 
 If more than one image exists, name the intended image explicitly instead of
-using a wildcard.
+using a wildcard. To inspect the GPT, decompress that image first; this creates
+the 2,036 MiB raw file:
+
+~~~
+xz -dk Armbian-unofficial_*_Vontar-dq08_*_minimal.img.xz
+fdisk -l Armbian-unofficial_*_Vontar-dq08_*_minimal.img
+~~~
+
+The build-time final-image check proves that the expected driver and pinned
+files are present. It does not exercise the SDIO bus, radio, antenna, or
+Bluetooth UART. After flashing and booting the newly rebuilt image, first
+confirm the physical SDIO identity without relying on a device-tree label:
+
+~~~
+sdio=/sys/bus/sdio/devices/mmc2:0001:1
+cat "$sdio/vendor"
+cat "$sdio/device"
+cat "$sdio/modalias"
+cat "$sdio/uevent"
+~~~
+
+Expected identifiers are vendor `0x02d0`, device `0x4335`, and an SDIO modalias
+containing `v02D0d4335`. Then inspect driver and firmware initialization:
+
+~~~
+journalctl -b -k -o cat --no-pager |
+  grep -Ei 'mmc2|sdio|brcmfmac|brcmutil|firmware'
+lsmod | grep -E 'brcmfmac|brcmutil|cfg80211'
+~~~
+
+A successful initialization includes `brcmfmac4335-sdio` for chip `BCM4335/1`
+and a later BCM4335 firmware-version message. A missing board-specific filename
+is harmless only if the log subsequently falls back to the generic file and
+finishes initialization. Missing generic `.bin` or `.txt` files, a firmware
+download timeout, or no wireless interface is a failure. An optional missing
+`.clm_blob` warning may restrict channels but does not by itself mean firmware
+loading failed.
+
+Exercise the radio rather than treating module loading as sufficient:
+
+~~~
+rfkill unblock wifi
+wifi_if="$(iw dev | awk '$1 == "Interface" { print $2; exit }')"
+test -n "$wifi_if"
+ip link set "$wifi_if" up
+iw dev "$wifi_if" info
+iw dev "$wifi_if" scan | grep -E '^BSS|^[[:space:]]+SSID:'
+~~~
+
+Nearby BSS entries prove that the SDIO transport, firmware, NVRAM, radio, and
+receive path are functioning. After configuring credentials through the
+selected Armbian networking stack, validate end-to-end traffic:
+
+~~~
+networkctl status "$wifi_if"
+ip -br address show dev "$wifi_if"
+ping -I "$wifi_if" -c 5 1.1.1.1
+~~~
+
+The default minimal build uses systemd-networkd. `nmcli` applies only when
+building with Armbian's NetworkManager stack.
+
+Check Bluetooth separately; Wi-Fi success does not validate the UART side of
+the combo module:
+
+~~~
+journalctl -b -k -o cat --no-pager |
+  grep -Ei 'bluetooth|hci_uart|btbcm|BCM4335'
+bluetoothctl list
+bluetoothctl show
+~~~
+
+Do not report BCM4335 Wi-Fi or Bluetooth as hardware-supported for a release
+until these checks pass on the rebuilt image. If the interface is absent,
+collect the complete logs and sysfs values above before changing SDIO timing or
+power-sequence properties.
+
+## Firmware provenance
 
 The module does not commit proprietary firmware binaries. During the build it
-fetches this exact public rkbin commit:
+fetches exact public repository commits and rejects unexpected hashes. Inspect
+the resolved source revisions with:
 
 ~~~
 git -C armbian-build/cache/sources/vontar-dq08-rkbin rev-parse HEAD
+git -C \
+  armbian-build/cache/sources/vontar-dq08-brcmfmac-sdio-firmware \
+  rev-parse HEAD
+~~~
+
+Expected commits:
+
+~~~
+f43a462e7a1429a9d407ae52b4745033034a6cf9  rockchip-linux/rkbin
+5987820e4ff88a5626536f66257165fe3a781b73  LibreELEC/brcmfmac_sdio-firmware
+~~~
+
+Verify all selected files:
+
+~~~
+sha256sum \
+  armbian-build/cache/sources/vontar-dq08-brcmfmac-sdio-firmware/brcmfmac4335-sdio.bin \
+  armbian-build/cache/sources/vontar-dq08-brcmfmac-sdio-firmware/brcmfmac4335-sdio.txt \
+  armbian-build/cache/sources/vontar-dq08-brcmfmac-sdio-firmware/BCM4335A0.hcd \
+  armbian-build/cache/sources/vontar-dq08-brcmfmac-sdio-firmware/BCM4335B0.hcd \
+  armbian-build/cache/sources/vontar-dq08-brcmfmac-sdio-firmware/BCM4335C0.hcd
 
 sha256sum \
   armbian-build/cache/sources/vontar-dq08-rkbin/bin/rk35/rk3528_ddr_1056MHz_4BIT_PCB_v1.10.bin \
@@ -214,6 +341,11 @@ sha256sum \
 Expected SHA-256 values:
 
 ~~~
+1551fd7680db31d230c70f55860ca071331a37eeb54c9229307b8fa475f9d6e7  brcmfmac4335-sdio.bin
+b88c57dbca6be918e3a1676e3c953a32b60ab8b4037f4a7ad1d87860c4160ee6  brcmfmac4335-sdio.txt
+3e14e7f3c02e19408c5783f845329309e23305ab5f33fb19abfd24a73a84cd8a  BCM4335A0.hcd
+3e14e7f3c02e19408c5783f845329309e23305ab5f33fb19abfd24a73a84cd8a  BCM4335B0.hcd
+5538cd96516729f7d35d7eecdedb0d8a0c441f9ce6d27aa873eb95d8adb59603  BCM4335C0.hcd
 f404365dd3929481052548c220aff3e82238bc7a679f13ab52e7e4e9ca1cfeb4  rk3528_ddr_1056MHz_4BIT_PCB_v1.10.bin
 3dde96556de969c92784e0f37b50a696bd457200353bbb611a91130b0ef960b9  rk3528_bl31_v1.18.elf
 ~~~

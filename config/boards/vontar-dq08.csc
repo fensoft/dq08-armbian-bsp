@@ -14,12 +14,12 @@ BOOT_FDT_FILE="rockchip/rk3528-vontar-dq08.dtb"
 BOOT_SCENARIO="binman"
 IMAGE_PARTITION_TABLE="gpt"
 BOOTFS_TYPE="ext4"
-BOOTSIZE="512"
+BOOTSIZE="256"
 SERIALCON="ttyS0"
 
-# Install the complete firmware bundle for the RTL8822CS Wi-Fi/Bluetooth module.
-BOARD_FIRMWARE_INSTALL="-full"
-PACKAGE_LIST_BOARD="i2c-tools ir-keytable python3-minimal rfkill bluetooth bluez bluez-tools"
+# Use Armbian's lean firmware package, supplemented by the BSP's pinned BCM4335 files.
+BOARD_FIRMWARE_INSTALL=""
+PACKAGE_LIST_BOARD="i2c-tools ir-keytable python3-minimal iw rfkill bluetooth bluez bluez-tools"
 
 # All procedural support and rootfs assets live in this module's extension.
 enable_extension "dq08-bsp"
