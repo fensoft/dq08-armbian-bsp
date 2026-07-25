@@ -121,6 +121,60 @@ The runner account is in the `docker` group (effectively root through Docker),
 but it has no passwordless `sudo`. Pull requests must remain on GitHub-hosted
 runners and must never be able to invoke a workflow using this runner.
 
+## Temporary local ARM64 runner
+
+Use this only while OCI reports no A1 capacity. Keep the OpenTofu-managed bucket
+and publisher PAR unchanged. Run the replacement runner inside a fresh,
+dedicated ARM64 VM with its own Docker daemon and 100 GB or more of usable
+storage; do not mount the host's home directory, OCI configuration, SSH agent,
+clipboard, or other credentials into it. Register it at repository scope with
+the same `dq08-builder` label and a fresh short-lived GitHub runner token.
+
+Do not substitute an LXD system container. An unprivileged container cannot
+provide the privileged loop-device and mount operations used by Armbian image
+assembly. A privileged nested container can provide them, but its root is not
+isolated from host root and therefore does not preserve this pipeline's
+credential boundary.
+
+In the OCI Console, open the private staging bucket and create a separate
+pre-authenticated request with access type `AnyObjectWrite`, object-name prefix
+`dq08/<repository-id>/`, and a short expiration. Copy the URL when OCI displays
+it; OCI does not show the bearer token again. This temporary credential permits
+writes only under that prefix, but not object reads, listing, or deletion. The
+workflow independently checks the same prefix before every upload.
+
+Store the URL only inside the isolated runner:
+
+```bash
+sudo install -o root -g github-runner -m 0440 /dev/null \
+  /etc/dq08-builder-write-par-url
+sudoedit /etc/dq08-builder-write-par-url
+sudoedit /etc/dq08-builder.env
+```
+
+The first file must contain exactly the full write-PAR base URL and one newline.
+Add this nonsecret line to `/etc/dq08-builder.env`:
+
+```text
+DQ08_STAGING_UPLOAD_MODE=write-par
+```
+
+Do not put the write PAR in `/etc/dq08-builder.env`, a GitHub secret or
+variable, shell startup files, service environment, Terraform state, runner
+diagnostics, or logs. The workflows require the credential file to be a
+non-symlink owned by UID 0, grouped to the runner's primary group, and mode
+`0440`; they validate its HTTPS endpoint against the configured region,
+namespace, and bucket before uploading with `Content-MD5`. Release objects
+include the workflow run ID and attempt in their key, so simultaneous or
+retried runs cannot overwrite each other's staging bytes. The bucket's
+three-day lifecycle policy removes them.
+
+Manually run **DQ08 Builder Health** before dispatching a release. When OCI
+capacity returns, stop and remove the local repository runner, change the mode
+back to `instance-principal` (or remove the mode line), revoke the temporary
+write PAR in OCI, and remove `/etc/dq08-builder-write-par-url`. Never reuse this
+write PAR as the hosted publisher's read-only credential.
+
 ## Configure GitHub publication
 
 Set these repository variables from nonsensitive outputs:
@@ -143,13 +197,14 @@ tofu output -raw staging_par_url | \
 ```
 
 The URL is a base ending in `/o/`; the publisher appends the URL-encoded exact
-object name. The builder does not use the PAR. It loads `/etc/dq08-builder.env`
-and invokes OCI CLI with `--auth instance_principal`. Self-hosted workflow steps
-must explicitly run `set -a; source /etc/dq08-builder.env; set +a`; runner jobs
-are non-login shells and cannot rely on `/etc/profile.d`. The policy permits the
-multipart create/overwrite/inspect/read operations needed by OCI CLI, but no
-object deletion and no bucket management. Failed multipart uploads are aborted
-by lifecycle policy after one day; completed staging objects are deleted after
+object name. In the normal configuration, the builder does not use a PAR. It
+loads `/etc/dq08-builder.env` and invokes OCI CLI with
+`--auth instance_principal`. Self-hosted workflow steps must explicitly run
+`set -a; source /etc/dq08-builder.env; set +a`; runner jobs are non-login shells
+and cannot rely on `/etc/profile.d`. The policy permits the multipart
+create/overwrite/inspect/read operations needed by OCI CLI, but no object
+deletion and no bucket management. Failed multipart uploads are aborted by
+lifecycle policy after one day; completed staging objects are deleted after
 three days.
 
 Terraform/OpenTofu state contains the PAR URL. Keep state private and never

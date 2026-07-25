@@ -297,7 +297,7 @@ jobs:
       actions: read
     env:
       MAX_ATTEMPTS: ${{ needs.control.outputs.max_attempts }}
-      STAGING_OBJECT: dq08/${{ github.repository_id }}/${{ needs.control.outputs.release_name }}/release.tar
+      STAGING_OBJECT: dq08/${{ github.repository_id }}/${{ needs.control.outputs.release_name }}/${{ github.run_id }}-${{ github.run_attempt }}/release.tar
     steps:
       - name: Download hosted control bundle
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
@@ -369,12 +369,14 @@ jobs:
           jq . "${RUNNER_TEMP}/build-result.json"
           printf 'stage_dir=%s\n' "${stage_dir}" >> "${GITHUB_OUTPUT}"
 
-      - name: Package and upload through the OCI instance principal
+      - name: Package and upload to private OCI staging
         env:
           STAGE_DIR: ${{ steps.build.outputs.stage_dir }}
           EXPECTED_OCI_REGION: ${{ vars.OCI_REGION }}
           EXPECTED_OCI_NAMESPACE: ${{ vars.OCI_OBJECT_STORAGE_NAMESPACE }}
           EXPECTED_OCI_BUCKET: ${{ vars.OCI_STAGING_BUCKET }}
+          EXPECTED_RELEASE_NAME: ${{ needs.control.outputs.release_name }}
+          EXPECTED_STAGING_PREFIX: dq08/${{ github.repository_id }}/
         shell: bash
         run: |
           set -euo pipefail
@@ -390,6 +392,10 @@ jobs:
           [[ "${OCI_REGION}" == "${EXPECTED_OCI_REGION}" ]]
           [[ "${OCI_OBJECT_STORAGE_NAMESPACE}" == "${EXPECTED_OCI_NAMESPACE}" ]]
           [[ "${OCI_STAGING_BUCKET}" == "${EXPECTED_OCI_BUCKET}" ]]
+          [[ "${EXPECTED_STAGING_PREFIX}" =~ ^dq08/[0-9]+/$ ]]
+          expected_staging_object="${EXPECTED_STAGING_PREFIX}${EXPECTED_RELEASE_NAME}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/release.tar"
+          [[ "${STAGING_OBJECT}" == "${expected_staging_object}" ]]
+          [[ "${MAX_ATTEMPTS}" =~ ^[123]$ ]]
 
           mapfile -t files < <(find "${STAGE_DIR}" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
           ((${#files[@]} == 4))
@@ -397,21 +403,93 @@ jobs:
           archive="${RUNNER_TEMP}/dq08-release.tar"
           tar --create --file "${archive}" --directory "${STAGE_DIR}" -- "${files[@]}"
 
+          upload_mode="${DQ08_STAGING_UPLOAD_MODE:-instance-principal}"
           uploaded=false
-          for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
-            if oci os object put \
-              --auth instance_principal \
-              --region "${OCI_REGION}" \
-              --namespace-name "${OCI_OBJECT_STORAGE_NAMESPACE}" \
-              --bucket-name "${OCI_STAGING_BUCKET}" \
-              --name "${STAGING_OBJECT}" \
-              --file "${archive}" \
-              --force >/dev/null; then
-              uploaded=true
-              break
-            fi
-            ((attempt == MAX_ATTEMPTS)) || sleep $((attempt * 10))
-          done
+          case "${upload_mode}" in
+            instance-principal)
+              for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
+                if oci os object put \
+                  --auth instance_principal \
+                  --region "${OCI_REGION}" \
+                  --namespace-name "${OCI_OBJECT_STORAGE_NAMESPACE}" \
+                  --bucket-name "${OCI_STAGING_BUCKET}" \
+                  --name "${STAGING_OBJECT}" \
+                  --file "${archive}" \
+                  --force >/dev/null; then
+                  uploaded=true
+                  break
+                fi
+                printf 'OCI instance-principal upload attempt %d failed.\n' "${attempt}" >&2
+                ((attempt == MAX_ATTEMPTS)) || sleep $((attempt * 10))
+              done
+              ;;
+            write-par)
+              par_file=/etc/dq08-builder-write-par-url
+              [[ -f "${par_file}" && ! -L "${par_file}" ]]
+              [[ "$(stat -c '%u:%g:%a' "${par_file}")" == "0:$(id -g):440" ]]
+              mapfile -t par_lines < "${par_file}"
+              ((${#par_lines[@]} == 1))
+              write_par_url="${par_lines[0]}"
+              [[ -n "${write_par_url}" && "${write_par_url}" != *$'\r'* ]]
+              if ! printf '%s' "${write_par_url}" | python3 -c '
+          import sys
+          from urllib.parse import unquote, urlsplit
+
+          region, namespace, bucket = sys.argv[1:]
+          url = sys.stdin.read()
+          parsed = urlsplit(url)
+          parts = parsed.path.split("/")
+          valid = (
+              url.isascii()
+              and all(0x21 <= ord(character) <= 0x7e for character in url)
+              and parsed.scheme == "https"
+              and parsed.netloc == f"objectstorage.{region}.oraclecloud.com"
+              and not parsed.query
+              and not parsed.fragment
+              and len(parts) == 9
+              and parts[0] == ""
+              and parts[1] == "p"
+              and bool(parts[2])
+              and parts[3] == "n"
+              and unquote(parts[4]) == namespace
+              and parts[5] == "b"
+              and unquote(parts[6]) == bucket
+              and parts[7] == "o"
+              and parts[8] == ""
+          )
+          raise SystemExit(0 if valid else 1)
+          ' "${OCI_REGION}" "${OCI_OBJECT_STORAGE_NAMESPACE}" "${OCI_STAGING_BUCKET}"; then
+                printf 'The local builder write PAR does not match the configured OCI bucket.\n' >&2
+                exit 1
+              fi
+
+              content_md5="$(openssl dgst -md5 -binary "${archive}" | base64 --wrap=0)"
+              encoded_object="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${STAGING_OBJECT}")"
+              for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
+                if curl --fail --silent --request PUT \
+                  --show-error \
+                  --proto '=https' \
+                  --connect-timeout 30 \
+                  --max-time 10800 \
+                  --speed-limit 1024 \
+                  --speed-time 300 \
+                  --header "Content-MD5: ${content_md5}" \
+                  --header 'Content-Type: application/x-tar' \
+                  --data-binary @"${archive}" \
+                  --output /dev/null \
+                  "${write_par_url}${encoded_object}"; then
+                  uploaded=true
+                  break
+                fi
+                printf 'OCI write-PAR upload attempt %d failed.\n' "${attempt}" >&2
+                ((attempt == MAX_ATTEMPTS)) || sleep $((attempt * 10))
+              done
+              ;;
+            *)
+              printf 'Unsupported DQ08_STAGING_UPLOAD_MODE: %s\n' "${upload_mode}" >&2
+              exit 1
+              ;;
+          esac
           [[ "${uploaded}" == true ]]
           printf 'Uploaded private staging object %s (%s bytes).\n' "${STAGING_OBJECT}" "$(stat -c %s "${archive}")"
 
@@ -428,7 +506,7 @@ jobs:
     env:
       RELEASE_NAME: ${{ needs.control.outputs.release_name }}
       DRY_RUN: ${{ needs.control.outputs.dry_run }}
-      STAGING_OBJECT: dq08/${{ github.repository_id }}/${{ needs.control.outputs.release_name }}/release.tar
+      STAGING_OBJECT: dq08/${{ github.repository_id }}/${{ needs.control.outputs.release_name }}/${{ github.run_id }}-${{ github.run_attempt }}/release.tar
     steps:
       - name: Check out trusted publisher and validators
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6

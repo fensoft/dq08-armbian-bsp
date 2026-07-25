@@ -18,11 +18,12 @@ jobs:
     runs-on: [self-hosted, Linux, ARM64, dq08-builder]
     timeout-minutes: 10
     steps:
-      - name: Check architecture, storage, Docker, and OCI identity
+      - name: Check architecture, storage, Docker, and OCI staging access
         env:
           EXPECTED_OCI_REGION: ${{ vars.OCI_REGION }}
           EXPECTED_OCI_NAMESPACE: ${{ vars.OCI_OBJECT_STORAGE_NAMESPACE }}
           EXPECTED_OCI_BUCKET: ${{ vars.OCI_STAGING_BUCKET }}
+          EXPECTED_STAGING_PREFIX: dq08/${{ github.repository_id }}/
         shell: bash
         run: |
           set -euo pipefail
@@ -41,13 +42,92 @@ jobs:
           [[ "${OCI_REGION}" == "${EXPECTED_OCI_REGION}" ]]
           [[ "${OCI_OBJECT_STORAGE_NAMESPACE}" == "${EXPECTED_OCI_NAMESPACE}" ]]
           [[ "${OCI_STAGING_BUCKET}" == "${EXPECTED_OCI_BUCKET}" ]]
+          [[ "${EXPECTED_STAGING_PREFIX}" =~ ^dq08/[0-9]+/$ ]]
           mkdir -p "${ARMBIAN_CACHE_DIR}"
           test -w "${ARMBIAN_CACHE_DIR}"
           docker info >/dev/null
-          oci os bucket get \
-            --auth instance_principal \
-            --region "${OCI_REGION}" \
-            --namespace-name "${OCI_OBJECT_STORAGE_NAMESPACE}" \
-            --bucket-name "${OCI_STAGING_BUCKET}" \
-            --query data.name --raw-output >/dev/null
+
+          upload_mode="${DQ08_STAGING_UPLOAD_MODE:-instance-principal}"
+          case "${upload_mode}" in
+            instance-principal)
+              oci os bucket get \
+                --auth instance_principal \
+                --region "${OCI_REGION}" \
+                --namespace-name "${OCI_OBJECT_STORAGE_NAMESPACE}" \
+                --bucket-name "${OCI_STAGING_BUCKET}" \
+                --query data.name --raw-output >/dev/null
+              ;;
+            write-par)
+              par_file=/etc/dq08-builder-write-par-url
+              [[ -f "${par_file}" && ! -L "${par_file}" ]]
+              [[ "$(stat -c '%u:%g:%a' "${par_file}")" == "0:$(id -g):440" ]]
+              mapfile -t par_lines < "${par_file}"
+              ((${#par_lines[@]} == 1))
+              write_par_url="${par_lines[0]}"
+              [[ -n "${write_par_url}" && "${write_par_url}" != *$'\r'* ]]
+              if ! printf '%s' "${write_par_url}" | python3 -c '
+          import sys
+          from urllib.parse import unquote, urlsplit
+
+          region, namespace, bucket = sys.argv[1:]
+          url = sys.stdin.read()
+          parsed = urlsplit(url)
+          parts = parsed.path.split("/")
+          valid = (
+              url.isascii()
+              and all(0x21 <= ord(character) <= 0x7e for character in url)
+              and parsed.scheme == "https"
+              and parsed.netloc == f"objectstorage.{region}.oraclecloud.com"
+              and not parsed.query
+              and not parsed.fragment
+              and len(parts) == 9
+              and parts[0] == ""
+              and parts[1] == "p"
+              and bool(parts[2])
+              and parts[3] == "n"
+              and unquote(parts[4]) == namespace
+              and parts[5] == "b"
+              and unquote(parts[6]) == bucket
+              and parts[7] == "o"
+              and parts[8] == ""
+          )
+          raise SystemExit(0 if valid else 1)
+          ' "${OCI_REGION}" "${OCI_OBJECT_STORAGE_NAMESPACE}" "${OCI_STAGING_BUCKET}"; then
+                printf 'The local builder write PAR does not match the configured OCI bucket.\n' >&2
+                exit 1
+              fi
+
+              health_object="${EXPECTED_STAGING_PREFIX}health/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.txt"
+              [[ "${health_object}" == "${EXPECTED_STAGING_PREFIX}"* ]]
+              health_file="${RUNNER_TEMP}/dq08-builder-health.txt"
+              printf 'staging_prefix=%s\nrun_id=%s\nrun_attempt=%s\n' \
+                "${EXPECTED_STAGING_PREFIX}" "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" \
+                > "${health_file}"
+              content_md5="$(openssl dgst -md5 -binary "${health_file}" | base64 --wrap=0)"
+              encoded_object="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${health_object}")"
+              uploaded=false
+              for attempt in 1 2 3; do
+                if curl --fail --silent --request PUT \
+                  --show-error \
+                  --proto '=https' \
+                  --connect-timeout 30 \
+                  --max-time 120 \
+                  --header "Content-MD5: ${content_md5}" \
+                  --header 'Content-Type: application/octet-stream' \
+                  --data-binary @"${health_file}" \
+                  --output /dev/null \
+                  "${write_par_url}${encoded_object}"; then
+                  uploaded=true
+                  break
+                fi
+                printf 'OCI write-PAR health upload attempt %d failed.\n' "${attempt}" >&2
+                ((attempt == 3)) || sleep $((attempt * 10))
+              done
+              [[ "${uploaded}" == true ]]
+              ;;
+            *)
+              printf 'Unsupported DQ08_STAGING_UPLOAD_MODE: %s\n' "${upload_mode}" >&2
+              exit 1
+              ;;
+          esac
           df -h "${ARMBIAN_CACHE_DIR}"

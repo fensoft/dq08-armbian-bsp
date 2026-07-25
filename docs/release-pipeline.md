@@ -22,12 +22,13 @@ dq08-armbian-vX.Y.Z-bsp-vA.B.C
 | Verify | GitHub-hosted | read-only repository token | Pull-request and push checks, install dry-run, helper tests |
 | Control | GitHub-hosted | read-only repository and Actions token | Stable-tag discovery, moved-tag check, Linux-series check, exact kernel resolution |
 | State lock | GitHub-hosted | `contents: write` | Persist the exact upstream tag-to-commit mapping before a build |
-| Build | OCI A1 self-hosted | Actions artifact read token and bucket-scoped OCI instance principal | Privileged Docker build and private staging upload |
+| Build | OCI A1 self-hosted, or a dedicated temporary ARM64 VM | Actions artifact read token and either a bucket-scoped OCI instance principal or local write-only PAR | Privileged Docker build and private staging upload |
 | Publish | GitHub-hosted `release` environment | read-only OCI PAR and ephemeral `contents: write` token | Independent validation and immutable publication |
 
-The privileged builder never receives the OCI read PAR or a GitHub write
-token. Pull requests run only on `ubuntu-24.04`; no pull-request event can
-select `dq08-builder`.
+The privileged builder never receives the publisher's OCI read PAR or a GitHub
+write token. A temporary local builder may receive a separate, short-lived
+write-only PAR through a root-owned local file. Pull requests run only on
+`ubuntu-24.04`; no pull-request event can select `dq08-builder`.
 
 ## One-time setup
 
@@ -79,7 +80,62 @@ Any branch ruleset covering `automation-state` must allow these workflow-token
 commits; the pipeline refuses to build when it cannot lock the upstream tag
 mapping first.
 
-### 3. Roll out the baseline
+### 3. Temporary local VM when OCI A1 has no capacity
+
+The normal and default upload mode is `instance-principal`. If Oracle cannot
+allocate an A1 VM, a fresh dedicated ARM64 VM may temporarily register with the
+same `dq08-builder` label. Do not use the developer workstation directly or
+share its home directory, OCI API keys, SSH agent, browser profiles, clipboard,
+or other host credentials with the VM because the runner can control its
+Docker daemon.
+
+An unprivileged LXD container is not sufficient for this build: Armbian's image
+assembly uses privileged Docker, loop devices, filesystem creation, and mounts.
+A privileged nested container would make its root equivalent to host root and
+would not provide the required credential boundary. Use a separate VM with its
+own virtual disk and Docker daemon.
+
+Create a second OCI pre-authenticated request on the existing private staging
+bucket with the `AnyObjectWrite` access type, object-name prefix
+`dq08/<repository-id>/`, and a short expiration. This is not the publisher PAR:
+it cannot read, list, delete, or write outside that prefix, and it must never be
+stored in GitHub Secrets, repository variables, `/etc/dq08-builder.env`, the
+repository, or a command that prints it. The workflow independently checks the
+same prefix before every upload.
+
+Inside the isolated builder, create a separate one-line credential file:
+
+```bash
+sudo install -o root -g github-runner -m 0440 /dev/null \
+  /etc/dq08-builder-write-par-url
+sudoedit /etc/dq08-builder-write-par-url
+```
+
+Paste only the full write-PAR base URL ending in `/o/`, followed by one newline.
+Then use `sudoedit /etc/dq08-builder.env` to add:
+
+```text
+DQ08_STAGING_UPLOAD_MODE=write-par
+```
+
+The health and release workflows reject a symlink, an owner other than root, a
+group other than the runner's primary group, any mode other than `0440`,
+multiple lines, an unexpected hostname, region, namespace, bucket, URL shape,
+or object-key prefix. Uploads include `Content-MD5`, use bounded retries, and
+never print the bearer URL. Every build uses a distinct object:
+
+```text
+dq08/<repository-id>/<release-name>/<run-id>-<run-attempt>/release.tar
+```
+
+The publisher continues to download only that exact object using its separate
+read-only `OCI_STAGING_PAR_URL`. Run **DQ08 Builder Health** before dispatching
+a build. Once the OCI A1 runner is available, set
+`DQ08_STAGING_UPLOAD_MODE=instance-principal` (or remove the setting), stop and
+remove the temporary runner, revoke the write PAR in OCI, and remove
+`/etc/dq08-builder-write-par-url`.
+
+### 4. Roll out the baseline
 
 1. Manually run **DQ08 Builder Health** and confirm it succeeds.
 2. Run **DQ08 Armbian Release** with `armbian_tag=v26.5.1`, `dry_run=true`, and
@@ -114,8 +170,8 @@ Before compilation, the controller:
 
 The builder compiles the kernel and U-Boot with artifact caches bypassed, then
 assembles Bookworm/current/minimal while retaining download, rootfs, and source
-caches. It emits `sha,xz` with XZ level 1 and stages one tar object in OCI. The
-tar contains exactly:
+caches. It emits `sha,xz` with XZ level 1 and stages one run-attempt-specific
+tar object in OCI. The tar contains exactly:
 
 ```text
 *.img.xz
@@ -164,7 +220,9 @@ schedule after prolonged inactivity. Manual dispatch remains the recovery path.
 OCI may reclaim an idle Always Free VM or temporarily have no A1 capacity. The
 100 GB cache volume is protected from ordinary destruction; use the
 reprovisioning procedure in [`infra/oci/README.md`](../infra/oci/README.md) and
-register a fresh short-lived runner token.
+register a fresh short-lived runner token. The isolated local-builder procedure
+above is a capacity fallback, not a replacement for the instance-principal
+design.
 
 ## Local checks
 
