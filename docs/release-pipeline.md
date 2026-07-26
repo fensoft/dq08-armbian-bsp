@@ -15,6 +15,23 @@ dq08-armbian-vX.Y.Z-bsp-vA.B.C
 `vX.Y.Z` is the exact Armbian tag and `vA.B.C` comes from
 `DQ08_MODULE_VERSION` in `module.conf`.
 
+The image filename carries the same provenance. `build.sh` reads Armbian's
+`VERSION` file and enforces:
+
+```text
+IMAGE_VERSION=<Armbian VERSION>-bsp-v${DQ08_MODULE_VERSION}
+```
+
+For example, BSP 1.4.9 on Armbian 26.5.1 produces an image name shaped as:
+
+```text
+Armbian-unofficial_26.5.1-bsp-v1.4.9_Vontar-dq08_bookworm_current_<kernel-version>_minimal.img.xz
+```
+
+Caller-supplied `IMAGE_VERSION=...` options are rejected before compilation;
+the image, checksum, and metadata asset names therefore cannot omit or
+misrepresent the BSP version.
+
 ## Trust boundaries
 
 | Stage | Runner | Credentials | Responsibility |
@@ -169,9 +186,10 @@ Before compilation, the controller:
    assertions.
 
 The builder compiles the kernel and U-Boot with artifact caches bypassed, then
-assembles Bookworm/current/minimal while retaining download, rootfs, and source
-caches. It emits `sha,xz` with XZ level 1 and stages one run-attempt-specific
-tar object in OCI. The tar contains exactly:
+assembles Bookworm/current/minimal with the enforced composite `IMAGE_VERSION`
+while retaining download, rootfs, and source caches. It emits `sha,xz` with XZ
+level 1 and stages one run-attempt-specific tar object in OCI. The tar contains
+exactly:
 
 ```text
 *.img.xz

@@ -34,15 +34,24 @@ git -C armbian-build checkout --detach 90fda43901b0127104227975ae62d35fbad05abc
   IMAGE_XZ_COMPRESSION_RATIO=1
 ```
 
-`build.sh` installs the BSP into `armbian-build/userpatches/` before building.
-The image is written to `armbian-build/output/images/`.
+`build.sh` installs the BSP into `armbian-build/userpatches/` before building
+and enforces:
+
+```text
+IMAGE_VERSION=<Armbian VERSION>-bsp-v${DQ08_MODULE_VERSION}
+```
+
+It reads the Armbian revision from `armbian-build/VERSION` and the BSP revision
+from `module.conf`. Do not pass `IMAGE_VERSION=...` as an extra option:
+caller overrides are rejected so the filename always identifies both source
+versions. The image is written to `armbian-build/output/images/`.
 
 ## Flash
 
 Use the whole-disk Lexar `by-id` link, never a kernel name or `-partN` link:
 
 ```sh
-IMAGE=armbian-build/output/images/Armbian-unofficial_26.08.0-trunk_Vontar-dq08_bookworm_current_6.18.39_minimal.img.xz
+IMAGE=armbian-build/output/images/Armbian-unofficial_26.08.0-trunk-bsp-v1.4.9_Vontar-dq08_bookworm_current_6.18.39_minimal.img.xz
 sudo ./dq08-armbian-bsp/flash.sh \
   "$IMAGE" /dev/disk/by-id/usb-Lexar_<device-id>
 ```

@@ -151,7 +151,12 @@ The build wrapper installs the module, then requests:
 - current Linux, which is 6.18 at the tested Armbian revision;
 - a minimal, non-desktop image;
 - Docker-based compilation;
-- Debian Bookworm by default.
+- Debian Bookworm by default; and
+- `IMAGE_VERSION=<Armbian VERSION>-bsp-v${DQ08_MODULE_VERSION}`.
+
+The wrapper reads the two version components from `armbian-build/VERSION` and
+`module.conf`. It rejects a caller-supplied `IMAGE_VERSION=...` option so an
+output filename cannot omit or misstate its BSP revision.
 
 The image appears in:
 
@@ -162,7 +167,7 @@ armbian-build/output/images/
 A tested filename is:
 
 ~~~
-Armbian-unofficial_26.08.0-trunk_Vontar-dq08_bookworm_current_6.18.39_minimal.img
+Armbian-unofficial_26.08.0-trunk-bsp-v1.4.9_Vontar-dq08_bookworm_current_6.18.39_minimal.img
 ~~~
 
 Armbian's release label may differ on a later checkout.
@@ -214,11 +219,13 @@ Build the image:
   BUILD_MINIMAL=yes \
   BUILD_DESKTOP=no \
   KERNEL_CONFIGURE=no \
+  IMAGE_VERSION=26.08.0-trunk-bsp-v1.4.9 \
   PREFER_DOCKER=yes
 ~~~
 
 PREFER_DOCKER=yes is a configuration option. Do not append a separate
-"docker" action to the command.
+"docker" action to the command. The direct command must set the composite
+`IMAGE_VERSION` explicitly; the supported wrapper derives and enforces it.
 
 The wrapper accepts another release and extra Armbian key/value options:
 
@@ -277,7 +284,7 @@ mounted target and never unmounts one itself. Use the whole-disk `by-id` link,
 with no `-partN` suffix:
 
 ~~~
-IMAGE=armbian-build/output/images/Armbian-unofficial_26.08.0-trunk_Vontar-dq08_bookworm_current_6.18.39_minimal.img.xz
+IMAGE=armbian-build/output/images/Armbian-unofficial_26.08.0-trunk-bsp-v1.4.9_Vontar-dq08_bookworm_current_6.18.39_minimal.img.xz
 DEVICE=/dev/disk/by-id/usb-Lexar_<device-id>
 sudo ./dq08-armbian-bsp/flash.sh "$IMAGE" "$DEVICE"
 ~~~
