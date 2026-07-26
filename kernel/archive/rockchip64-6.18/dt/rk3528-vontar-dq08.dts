@@ -197,13 +197,22 @@
 };
 
 &pinctrl {
+	bt_host_wake_input: pcfg-bt-host-wake-input {
+		input-enable;
+		bias-pull-down;
+	};
+
 	bluetooth {
 		bt_enable_h: bt-enable-h {
 			rockchip,pins = <3 RK_PC2 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 
 		bt_host_wake_h: bt-host-wake-h {
-			rockchip,pins = <3 RK_PC1 RK_FUNC_GPIO &pcfg_pull_down>;
+			rockchip,pins = <3 RK_PC1 RK_FUNC_GPIO &bt_host_wake_input>;
+		};
+
+		bt_host_wake_boot_h: bt-host-wake-boot-h {
+			rockchip,pins = <3 RK_PC1 RK_FUNC_GPIO &pcfg_output_high>;
 		};
 	};
 
@@ -328,19 +337,39 @@
 };
 
 &uart2 {
+	/*
+	 * Linux 6.18 carries the corrected RK3528 UART2 DMA request order:
+	 * TX channel 13 followed by RX channel 12.  Name both inherited
+	 * channels as required by the binding.  This matches the upstream
+	 * ArmSoM Sige1 configuration which fixed the same Broadcom HCI Reset
+	 * timeout on RK3528.
+	 */
+	dma-names = "tx", "rx";
 	pinctrl-names = "default";
 	pinctrl-0 = <&uart2m0_xfer>, <&uart2m0_ctsn>, <&uart2m0_rtsn>;
 	uart-has-rtscts;
 	status = "okay";
 
 	bluetooth {
-		compatible = "brcm,bcm4335a0";
+		/*
+		 * Read Local Version identifies the controller as BCM4335A0.
+		 * Keep the DQ08 compatible first for its PC1/PC2 bootstrap
+		 * quirk and retain the silicon compatible as a fallback.
+		 * No max-speed property means HCI starts at 115200 bit/s.
+		 */
+		compatible = "vontar,dq08-bluetooth", "brcm,bcm4335a0";
+		brcm,dq08-startup-sequence;
+		clocks = <&cru CLK_DEEPSLOW>;
+		clock-names = "lpo";
 		interrupt-parent = <&gpio3>;
-		interrupts = <RK_PC1 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <RK_PC1 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "host-wakeup";
-		pinctrl-names = "default";
+		pinctrl-names = "default", "host-wake-high";
 		pinctrl-0 = <&bt_enable_h>, <&bt_host_wake_h>;
+		pinctrl-1 = <&bt_enable_h>, <&bt_host_wake_boot_h>;
 		shutdown-gpios = <&gpio3 RK_PC2 GPIO_ACTIVE_HIGH>;
+		vbat-supply = <&vcc3v3_wifi>;
+		vddio-supply = <&vccio_sd>;
 	};
 };
 

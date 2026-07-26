@@ -1,0 +1,263 @@
+diff --git a/Documentation/devicetree/bindings/net/bluetooth/brcm,bluetooth.yaml b/Documentation/devicetree/bindings/net/bluetooth/brcm,bluetooth.yaml
+index 3c410ca..ea12dc3 100644
+--- a/Documentation/devicetree/bindings/net/bluetooth/brcm,bluetooth.yaml
++++ b/Documentation/devicetree/bindings/net/bluetooth/brcm,bluetooth.yaml
+@@ -15,6 +15,9 @@ description:
+ properties:
+   compatible:
+     oneOf:
++      - items:
++          - const: vontar,dq08-bluetooth
++          - const: brcm,bcm4335a0
+       - items:
+           - enum:
+               - infineon,cyw43439-bt
+@@ -102,6 +105,17 @@ properties:
+        pcm-sync-mode: slave, master
+        pcm-clock-mode: slave, master
+ 
++  brcm,dq08-startup-sequence:
++    type: boolean
++    description: |
++      Local Vontar DQ08 BSP opt-in. Hold BT_REG_ON low and drive HOST_WAKE
++      high for 40 ms, raise BT_REG_ON, keep HOST_WAKE high for another 20 ms,
++      return HOST_WAKE to input, then wait 150 ms before the first HCI command.
++      UART RTS remains muxed to the UART; hardware flow control is enabled
++      before HCI traffic. HCI starts at 115200 bit/s using the normal Broadcom
++      firmware setup. The default and host-wake-high pinctrl states must be
++      provided. This is a board quirk, not a BCM4335-wide requirement.
++
+   brcm,requires-autobaud-mode:
+     type: boolean
+     description:
+@@ -127,6 +141,20 @@ dependencies:
+ 
+ allOf:
+   - $ref: /schemas/serial/serial-peripheral-props.yaml#
++  - if:
++      required:
++        - brcm,dq08-startup-sequence
++    then:
++      properties:
++        pinctrl-names:
++          items:
++            - const: default
++            - const: host-wake-high
++      required:
++        - pinctrl-names
++        - pinctrl-0
++        - pinctrl-1
++        - shutdown-gpios
+   - if:
+       not:
+         properties:
+diff --git a/drivers/bluetooth/hci_bcm.c b/drivers/bluetooth/hci_bcm.c
+index fff845e..c146472 100644
+--- a/drivers/bluetooth/hci_bcm.c
++++ b/drivers/bluetooth/hci_bcm.c
+@@ -17,6 +17,7 @@
+ #include <linux/property.h>
+ #include <linux/platform_data/x86/apple.h>
+ #include <linux/platform_device.h>
++#include <linux/pinctrl/consumer.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/clk.h>
+ #include <linux/gpio/consumer.h>
+@@ -105,6 +106,11 @@ struct bcm_device_data {
+  * @no_early_set_baudrate: don't set_baudrate before setup()
+  * @drive_rts_on_open: drive RTS signal on ->open() when platform requires it
+  * @no_uart_clock_set: UART clock set command for >3Mbps mode is unavailable
++ * @dq08_startup_sequence: reproduce the DQ08 module's factory power-on
++ *	sequence before the first HCI command
++ * @dq08_pinctrl: pin controller used by the DQ08 startup sequence
++ * @dq08_pins_default: normal HOST_WAKE input state
++ * @dq08_pins_host_wake_high: startup state driving HOST_WAKE high
+  * @pcm_int_params: keep the initial PCM configuration
+  * @use_autobaud_mode: start Bluetooth device in autobaud mode
+  * @max_autobaud_speed: max baudrate supported by device in autobaud mode
+@@ -145,6 +151,10 @@ struct bcm_device {
+ #endif
+ 	bool			no_early_set_baudrate;
+ 	bool			drive_rts_on_open;
++	bool			dq08_startup_sequence;
++	struct pinctrl		*dq08_pinctrl;
++	struct pinctrl_state	*dq08_pins_default;
++	struct pinctrl_state	*dq08_pins_host_wake_high;
+ 	bool			no_uart_clock_set;
+ 	bool			use_autobaud_mode;
+ 	u8			pcm_int_params[5];
+@@ -281,10 +291,22 @@ static int bcm_gpio_set_power(struct bcm_device *dev, bool powered)
+ 	if (err)
+ 		goto err_txco_clk_disable;
+ 
++	if (powered && dev->dq08_startup_sequence) {
++		/*
++		 * BCM4335A0 samples HOST_WAKE after BT_REG_ON rises. Keep it
++		 * high for 20 ms before returning the pin to input mode.
++		 */
++		msleep(20);
++		err = pinctrl_select_state(dev->dq08_pinctrl,
++					   dev->dq08_pins_default);
++		if (err)
++			goto err_revert_shutdown;
++	}
++
+ 	err = dev->set_device_wakeup(dev, powered);
+ 	if (err)
+ 		goto err_revert_shutdown;
+ 
+ 	if (!powered && dev->res_enabled) {
+ 		clk_disable_unprepare(dev->txco_clk);
+ 		clk_disable_unprepare(dev->lpo_clk);
+@@ -298,8 +320,11 @@ static int bcm_gpio_set_power(struct bcm_device *dev, bool powered)
+ 	}
+ 
+ 	/* wait for device to power on and come out of reset */
+-	usleep_range(100000, 120000);
++	if (powered && dev->dq08_startup_sequence)
++		msleep(150);
++	else
++		usleep_range(100000, 120000);
+ 
+ 	dev->res_enabled = powered;
+ 
+ 	return 0;
+@@ -485,7 +510,9 @@ static int bcm_open(struct hci_uart *hu)
+ 
+ out:
+ 	if (bcm->dev) {
+-		if (bcm->dev->use_autobaud_mode)
++		if (bcm->dev->dq08_startup_sequence)
++			hci_uart_set_flow_control(hu, true);
++		else if (bcm->dev->use_autobaud_mode)
+ 			hci_uart_set_flow_control(hu, false);	/* Assert BT_UART_CTS_N */
+ 		else if (bcm->dev->drive_rts_on_open)
+ 			hci_uart_set_flow_control(hu, true);
+@@ -498,22 +525,60 @@ out:
+ 		/* If oper_speed is set, ldisc/serdev will set the baudrate
+ 		 * before calling setup()
+ 		 */
+-		if (!bcm->dev->no_early_set_baudrate && !bcm->dev->use_autobaud_mode)
++		if (!bcm->dev->no_early_set_baudrate &&
++		    !bcm->dev->use_autobaud_mode &&
++		    !bcm->dev->dq08_startup_sequence)
+ 			hu->oper_speed = bcm->dev->oper_speed;
+ 
++		if (bcm->dev->dq08_startup_sequence) {
++			/*
++			 * Proven raw-UART sequence: hold BT_REG_ON low and
++			 * drive HOST_WAKE high for 40 ms. bcm_gpio_set_power()
++			 * then raises BT_REG_ON, keeps HOST_WAKE high for
++			 * another 20 ms, releases it to input, and settles.
++			 */
++			err = bcm->dev->set_shutdown(bcm->dev, false);
++			if (err)
++				goto err_restore_pins;
++
++			err = pinctrl_select_state(
++				bcm->dev->dq08_pinctrl,
++				bcm->dev->dq08_pins_host_wake_high);
++			if (err)
++				goto err_restore_pins;
++			msleep(40);
++		}
++
+ 		err = bcm_gpio_set_power(bcm->dev, true);
+ 
+-		if (bcm->dev->drive_rts_on_open)
++		if (bcm->dev->drive_rts_on_open &&
++		    !bcm->dev->dq08_startup_sequence)
+ 			hci_uart_set_flow_control(hu, false);
+ 
+ 		if (err)
+-			goto err_unset_hu;
++			goto err_restore_pins;
++
++		if (bcm->dev->dq08_startup_sequence) {
++			/*
++			 * Restore CRTSCTS without changing the UART pin mux.
++			 * The normal Broadcom setup starts at 115200 bit/s,
++			 * identifies BCM4335A0, and loads its HCD firmware.
++			 */
++			hci_uart_set_flow_control(hu, false);
++			dev_info(bcm->dev->dev,
++				 "DQ08 Bluetooth startup sequence applied\n");
++		}
+ 	}
+ 
+ 	mutex_unlock(&bcm_device_lock);
+ 	return 0;
+ 
+-err_unset_hu:
++err_restore_pins:
++	if (bcm->dev->dq08_startup_sequence)
++		pinctrl_select_state(bcm->dev->dq08_pinctrl,
++				     bcm->dev->dq08_pins_default);
++	if (bcm->dev->dq08_startup_sequence)
++		hci_uart_set_flow_control(hu, false);
+ #ifdef CONFIG_PM
+ 	if (!hu->serdev)
+ 		bcm->dev->hu = NULL;
+@@ -1227,8 +1292,42 @@ static int bcm_acpi_probe(struct bcm_device *dev)
+ 
+ static int bcm_of_probe(struct bcm_device *bdev)
+ {
++	int err;
++
+ 	bdev->use_autobaud_mode = device_property_read_bool(bdev->dev,
+ 							    "brcm,requires-autobaud-mode");
++	bdev->dq08_startup_sequence =
++		device_property_read_bool(bdev->dev,
++					  "brcm,dq08-startup-sequence");
++	if (bdev->dq08_startup_sequence) {
++		bdev->dq08_pinctrl = devm_pinctrl_get(bdev->dev);
++		if (IS_ERR(bdev->dq08_pinctrl))
++			return dev_err_probe(bdev->dev,
++					     PTR_ERR(bdev->dq08_pinctrl),
++					     "failed to get bootstrap pinctrl\n");
++
++		bdev->dq08_pins_default =
++			pinctrl_lookup_state(bdev->dq08_pinctrl,
++					     PINCTRL_STATE_DEFAULT);
++		if (IS_ERR(bdev->dq08_pins_default))
++			return dev_err_probe(bdev->dev,
++					     PTR_ERR(bdev->dq08_pins_default),
++					     "failed to get default pin state\n");
++
++		bdev->dq08_pins_host_wake_high =
++			pinctrl_lookup_state(bdev->dq08_pinctrl,
++					     "host-wake-high");
++		if (IS_ERR(bdev->dq08_pins_host_wake_high))
++			return dev_err_probe(bdev->dev,
++					     PTR_ERR(bdev->dq08_pins_host_wake_high),
++					     "failed to get host-wake-high pin state\n");
++
++		err = pinctrl_select_state(bdev->dq08_pinctrl,
++					   bdev->dq08_pins_default);
++		if (err)
++			return dev_err_probe(bdev->dev, err,
++					     "failed to select default pin state\n");
++	}
+ 	device_property_read_u32(bdev->dev, "max-speed", &bdev->oper_speed);
+ 	device_property_read_u8_array(bdev->dev, "brcm,bt-pcm-int-params",
+ 				      bdev->pcm_int_params, 5);
+@@ -1596,6 +1695,7 @@ static const struct of_device_id bcm_bluetooth_of_match[] = {
+ 	{ .compatible = "brcm,bcm4349-bt", .data = &bcm43438_device_data },
+ 	{ .compatible = "brcm,bcm43540-bt", .data = &bcm4354_device_data },
++	{ .compatible = "vontar,dq08-bluetooth" },
+ 	{ .compatible = "brcm,bcm4335a0" },
+ 	{ .compatible = "cypress,cyw4373a0-bt", .data = &cyw4373a0_device_data },
+ 	{ .compatible = "infineon,cyw55572-bt", .data = &cyw55572_device_data },
+ 	{ },
+diff --git a/drivers/bluetooth/btsdio.c b/drivers/bluetooth/btsdio.c
+index 8325655..4d6d9a9 100644
+--- a/drivers/bluetooth/btsdio.c
++++ b/drivers/bluetooth/btsdio.c
+@@ -290,6 +290,7 @@ static int btsdio_probe(struct sdio_func *func,
+ 	if (func->vendor == SDIO_VENDOR_ID_BROADCOM &&
+ 	    !mmc_card_is_removable(func->card->host)) {
+ 		switch (func->device) {
++		case SDIO_DEVICE_ID_BROADCOM_4335_4339:
+ 		case SDIO_DEVICE_ID_BROADCOM_43341:
+ 		case SDIO_DEVICE_ID_BROADCOM_43430:
+ 		case SDIO_DEVICE_ID_BROADCOM_4345:

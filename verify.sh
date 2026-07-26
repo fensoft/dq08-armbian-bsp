@@ -28,9 +28,7 @@ for checksum_var in \
 	DQ08_RKBIN_BL31_SHA256 \
 	DQ08_BCM4335_WIFI_SHA256 \
 	DQ08_BCM4335_NVRAM_SHA256 \
-	DQ08_BCM4335_BT_A0_SHA256 \
-	DQ08_BCM4335_BT_B0_SHA256 \
-	DQ08_BCM4335_BT_C0_SHA256; do
+	DQ08_BCM4335_BT_A0_SHA256; do
 	checksum_value="${!checksum_var}"
 	if [[ ! "${checksum_value}" =~ ^[0-9a-f]{64}$ ]]; then
 		printf 'Invalid %s: %s\n' "${checksum_var}" "${checksum_value}" >&2
@@ -70,8 +68,6 @@ bcm_firmware_metadata=(
 	"DQ08_BCM4335_WIFI_SHA256=${DQ08_BCM4335_WIFI_SHA256}"
 	"DQ08_BCM4335_NVRAM_SHA256=${DQ08_BCM4335_NVRAM_SHA256}"
 	"DQ08_BCM4335_BT_A0_SHA256=${DQ08_BCM4335_BT_A0_SHA256}"
-	"DQ08_BCM4335_BT_B0_SHA256=${DQ08_BCM4335_BT_B0_SHA256}"
-	"DQ08_BCM4335_BT_C0_SHA256=${DQ08_BCM4335_BT_C0_SHA256}"
 )
 for metadata_assignment in "${bcm_firmware_metadata[@]}"; do
 	metadata_var="${metadata_assignment%%=*}"
@@ -88,12 +84,40 @@ if ! grep -Fq '"https://github.com/LibreELEC/brcmfmac_sdio-firmware.git"' "${ext
 	printf 'BCM4335 firmware source is not fetched from the pinned repository commit.\n' >&2
 	errors=$((errors + 1))
 fi
+factory_nvram="${module_root}/extensions/dq08-bsp/files/usr/lib/firmware/brcm/brcmfmac4335-sdio.txt"
+factory_hcd="${module_root}/extensions/dq08-bsp/files/usr/lib/firmware/brcm/BCM4335A0.hcd"
+if [[ "$(sha256sum "${factory_nvram}" 2> /dev/null | awk '{print $1}')" != \
+	"${DQ08_BCM4335_NVRAM_SHA256}" ]]; then
+	printf 'Factory BCM4335 NVRAM checksum mismatch: %s\n' "${factory_nvram}" >&2
+	errors=$((errors + 1))
+fi
+if [[ "$(sha256sum "${factory_hcd}" 2> /dev/null | awk '{print $1}')" != \
+	"${DQ08_BCM4335_BT_A0_SHA256}" ]]; then
+	printf 'Factory BCM4335A0 HCD checksum mismatch: %s\n' "${factory_hcd}" >&2
+	errors=$((errors + 1))
+fi
+if ! grep -Fq '#SEMCO B62_G3_VID:3388 (4335B0)' "${factory_nvram}" 2> /dev/null ||
+	! grep -Fq 'boardtype=0x064d' "${factory_nvram}" 2> /dev/null; then
+	printf 'Factory BCM4335 NVRAM identity/calibration markers are missing.\n' >&2
+	errors=$((errors + 1))
+fi
 for bcm_hook in \
 	'function fetch_sources_tools__vontar_dq08_bcm4335_firmware() {' \
 	'function post_family_tweaks_bsp__vontar_dq08_assets() {' \
 	'function pre_umount_final_image__vontar_dq08_verify_bcm4335() {'; do
 	if ! grep -Fq "${bcm_hook}" "${extension_file}"; then
 		printf 'Required BCM4335 build hook is missing: %s\n' "${bcm_hook}" >&2
+		errors=$((errors + 1))
+	fi
+done
+for boot_script_guard in \
+	'local packaged_boot_cmd="${destination}/usr/share/armbian/boot.cmd"' \
+	"'s/console=ttyS2,1500000/console=ttyS0,1500000/g'" \
+	'missing+=("boot-script:packaged-ttyS0")' \
+	'missing+=("boot-script:stale-ttyS2")'; do
+	if ! grep -Fq "${boot_script_guard}" "${extension_file}"; then
+		printf 'Packaged DQ08 ttyS0 boot-script guard is missing: %s\n' \
+			"${boot_script_guard}" >&2
 		errors=$((errors + 1))
 	fi
 done
@@ -158,6 +182,7 @@ for wifi_kernel_option in \
 	PWRSEQ_SIMPLE \
 	REGULATOR_FIXED_VOLTAGE \
 	SERIAL_DEV_BUS \
+	SERIAL_DEV_CTRL_TTYPORT \
 	WLAN \
 	WLAN_VENDOR_BROADCOM; do
 	if ! extension_array_has_quoted_item "opts_y" "${wifi_kernel_option}"; then
@@ -208,8 +233,6 @@ bcm_image_firmware=(
 	"brcm/brcmfmac4335-sdio.bin=DQ08_BCM4335_WIFI_SHA256"
 	"brcm/brcmfmac4335-sdio.txt=DQ08_BCM4335_NVRAM_SHA256"
 	"brcm/BCM4335A0.hcd=DQ08_BCM4335_BT_A0_SHA256"
-	"brcm/BCM4335B0.hcd=DQ08_BCM4335_BT_B0_SHA256"
-	"brcm/BCM4335C0.hcd=DQ08_BCM4335_BT_C0_SHA256"
 )
 for firmware_assignment in "${bcm_image_firmware[@]}"; do
 	relative_path="${firmware_assignment%%=*}"
@@ -294,18 +317,144 @@ for wifi_dts_property in \
 	'compatible = "brcm,bcm4335-fmac", "brcm,bcm4329-fmac";' \
 	'interrupts = <RK_PB3 IRQ_TYPE_LEVEL_HIGH>;' \
 	'interrupt-names = "host-wake";' \
+	'bt_host_wake_input: pcfg-bt-host-wake-input {' \
+	'input-enable;' \
+	'bt_host_wake_h: bt-host-wake-h {' \
+	'rockchip,pins = <3 RK_PC1 RK_FUNC_GPIO &bt_host_wake_input>;' \
+	'bt_host_wake_boot_h: bt-host-wake-boot-h {' \
+	'rockchip,pins = <3 RK_PC1 RK_FUNC_GPIO &pcfg_output_high>;' \
 	'&uart2 {' \
+	'dma-names = "tx", "rx";' \
+	'pinctrl-0 = <&uart2m0_xfer>, <&uart2m0_ctsn>, <&uart2m0_rtsn>;' \
 	'uart-has-rtscts;' \
-	'compatible = "brcm,bcm4335a0";' \
+	'compatible = "vontar,dq08-bluetooth", "brcm,bcm4335a0";' \
+	'brcm,dq08-startup-sequence;' \
+	'clocks = <&cru CLK_DEEPSLOW>;' \
+	'clock-names = "lpo";' \
 	'interrupt-names = "host-wakeup";' \
-	'shutdown-gpios = <&gpio3 RK_PC2 GPIO_ACTIVE_HIGH>;'; do
+	'pinctrl-names = "default", "host-wake-high";' \
+	'pinctrl-0 = <&bt_enable_h>, <&bt_host_wake_h>;' \
+	'pinctrl-1 = <&bt_enable_h>, <&bt_host_wake_boot_h>;' \
+	'shutdown-gpios = <&gpio3 RK_PC2 GPIO_ACTIVE_HIGH>;' \
+	'vbat-supply = <&vcc3v3_wifi>;' \
+	'vddio-supply = <&vccio_sd>;'; do
 	if ! grep -Fq "${wifi_dts_property}" "${dts_file}"; then
 		printf 'BCM4335 device-tree wiring is missing: %s\n' "${wifi_dts_property}" >&2
 		errors=$((errors + 1))
 	fi
 done
-if ! grep -Eq 'interrupts = <RK_PC1 IRQ_TYPE_(EDGE_RISING|LEVEL_HIGH)>;' "${dts_file}"; then
+for forbidden_dma_override in \
+	'/delete-property/ dmas;' \
+	'/delete-property/ dma-names;'; do
+	if grep -Fq "${forbidden_dma_override}" "${dts_file}"; then
+		printf 'UART2 must retain the corrected Linux 6.18 DMA mapping: %s\n' \
+			"${forbidden_dma_override}" >&2
+		errors=$((errors + 1))
+	fi
+done
+if ! grep -Fq 'interrupts = <RK_PC1 IRQ_TYPE_EDGE_RISING>;' "${dts_file}"; then
 	printf 'BCM4335 Bluetooth host-wakeup IRQ wiring is missing or has an invalid trigger.\n' >&2
+	errors=$((errors + 1))
+fi
+for forbidden_bluetooth_property in \
+	'brcm,pulse-rts-on-open' \
+	'brcm,dq08-bootstrap' \
+	'bt_rts_boot_' \
+	'rts-low' \
+	'rts-high'; do
+	if grep -Fq "${forbidden_bluetooth_property}" "${dts_file}"; then
+		printf 'Obsolete DQ08 Bluetooth startup property remains: %s\n' \
+			"${forbidden_bluetooth_property}" >&2
+		errors=$((errors + 1))
+	fi
+done
+bluetooth_dts_block="$(
+	sed -n '/^[[:space:]]*bluetooth[[:space:]]*{/,/^[[:space:]]*};[[:space:]]*$/p' \
+		"${dts_file}"
+)"
+if grep -Eq '^[[:space:]]*max-speed[[:space:]]*=' <<< "${bluetooth_dts_block}"; then
+	printf 'Obsolete DQ08 Bluetooth max-speed property remains.\n' >&2
+	errors=$((errors + 1))
+fi
+
+hci_patch="${module_root}/kernel/archive/rockchip64-${DQ08_KERNEL_SERIES}/dq08-bluetooth-factory-bootstrap.patch"
+for hci_patch_fragment in \
+	'brcm,dq08-startup-sequence' \
+	'vontar,dq08-bluetooth' \
+	'brcm,bcm4335a0' \
+	'bcm->dev->set_shutdown(bcm->dev, false)' \
+	'msleep(20);' \
+	'msleep(40);' \
+	'msleep(150);' \
+	'dq08_pins_host_wake_high' \
+	'hci_uart_set_flow_control(hu, false);' \
+	'case SDIO_DEVICE_ID_BROADCOM_4335_4339:' \
+	'DQ08 Bluetooth startup sequence applied'; do
+	if ! grep -Fq "${hci_patch_fragment}" "${hci_patch}"; then
+		printf 'DQ08 hci_bcm startup patch is incomplete: %s\n' \
+			"${hci_patch_fragment}" >&2
+		errors=$((errors + 1))
+	fi
+done
+if grep -Fq 'restore_flow_control:' "${hci_patch}"; then
+	printf 'Obsolete DQ08 hci_bcm flow-control restore path remains.\n' >&2
+	errors=$((errors + 1))
+fi
+for forbidden_hci_fragment in \
+	'CTS bypassed' \
+	'dq08_pins_rts_low' \
+	'dq08_pins_rts_high' \
+	'"rts-low"' \
+	'"rts-high"' \
+	'msleep(100);' \
+	'serdev_device_set_flow_control(hu->serdev, false);' \
+	'serdev_device_set_flow_control(bdev->hu->serdev, false);'; do
+	if grep -Fq "${forbidden_hci_fragment}" "${hci_patch}"; then
+		printf 'Obsolete DQ08 Bluetooth diagnostic remains: %s\n' \
+			"${forbidden_hci_fragment}" >&2
+		errors=$((errors + 1))
+	fi
+done
+if (($(grep -Fc 'bcm->dev->set_shutdown(bcm->dev, false)' "${hci_patch}") != 1)); then
+	printf 'DQ08 hci_bcm patch does not explicitly hold BT_REG_ON low before bootstrap.\n' >&2
+	errors=$((errors + 1))
+fi
+
+modules_load_file="${module_root}/extensions/dq08-bsp/files/etc/modules-load.d/vontar-dq08-bluetooth.conf"
+if ! grep -Eq '^[[:space:]]*hci_uart([[:space:]]*(#.*)?)?$' "${modules_load_file}" 2> /dev/null; then
+	printf 'Bluetooth UART module autoload configuration is missing.\n' >&2
+	errors=$((errors + 1))
+fi
+
+if find "${module_root}/kernel" -type f -name '*bluetooth*hci*bcm*rts*.patch' -print -quit |
+	grep -q .; then
+	printf 'Obsolete custom DQ08 hci_bcm RTS patch remains in the module.\n' >&2
+	errors=$((errors + 1))
+fi
+
+flash_script="${module_root}/flash.sh"
+for flash_safety_fragment in \
+	'[[ "${device_link}" == /dev/disk/by-id/* ]]' \
+	'[[ "${device_link##*/}" != *-part* ]]' \
+	'device_size >= 55000000000 && device_size <= 70000000000' \
+	'[[ "${identity,,}" == *lexar* ]]' \
+	'root-device ancestry' \
+	'findmnt -rn -S "${node}" -o TARGET' \
+	'swapon --noheadings --raw --show=NAME' \
+	'/sys/class/block/${node##*/}/holders' \
+	'sidecar="${image}.sha"' \
+	'xz --test -- "${image}"' \
+	'dd of="${device}" bs=4M iflag=fullblock conv=fsync status=progress' \
+	'blockdev --flushbufs "${device}"' \
+	'head -c "${raw_size}" -- "${device}"'; do
+	if ! grep -Fq "${flash_safety_fragment}" "${flash_script}"; then
+		printf 'Host flasher safety check is missing: %s\n' \
+			"${flash_safety_fragment}" >&2
+		errors=$((errors + 1))
+	fi
+done
+if grep -Eq '(^|[[:space:]])(umount|wipefs|mkfs([.]|[[:space:]]))' "${flash_script}"; then
+	printf 'Host flasher must reject mounted media rather than altering it first.\n' >&2
 	errors=$((errors + 1))
 fi
 
@@ -336,7 +485,12 @@ done < "${manifest}"
 
 bash -n "${module_root}/config/boards/vontar-dq08.csc"
 bash -n "${module_root}/extensions/dq08-bsp/dq08-bsp.sh"
-bash -n "${module_root}/install.sh" "${module_root}/uninstall.sh" "${module_root}/build.sh" "${module_root}/verify.sh"
+bash -n \
+	"${module_root}/build.sh" \
+	"${module_root}/flash.sh" \
+	"${module_root}/install.sh" \
+	"${module_root}/uninstall.sh" \
+	"${module_root}/verify.sh"
 python3 - "${module_root}/extensions/dq08-bsp/files/usr/libexec/dq08-front-panel" <<'PYTHON'
 import pathlib
 import sys

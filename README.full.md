@@ -19,26 +19,54 @@ The module is pinned to Armbian's supported **current** kernel line, Linux
 | Linux | 6.18.39 at f89c296854b755a66657065c35b05406fc18264d |
 | U-Boot | v2026.04 at 88dc2788777babfd6322fa655df549a019aa1e69 |
 | Rockchip rkbin | f43a462e7a1429a9d407ae52b4745033034a6cf9 |
-| HK2735M firmware | LibreELEC/brcmfmac_sdio-firmware at 5987820e4ff88a5626536f66257165fe3a781b73 |
+| BCM4335 Wi-Fi firmware | LibreELEC/brcmfmac_sdio-firmware at 5987820e4ff88a5626536f66257165fe3a781b73 |
+| BCM4335A0 Bluetooth HCD | Official Vontar DQ08 factory payload, SHA-256 `3e14e7f3c02e19408c5783f845329309e23305ab5f33fb19abfd24a73a84cd8a` |
 | Source BSP | fensoft/dq08-haos at ebc35462a307fad483a7ea0f01b05cbc2b17d458 |
 
-The device tree covers eMMC, microSD, Ethernet, USB, HK2735M/BCM4335
-Wi-Fi/Bluetooth, infrared input, the power LED, serial console, and the I2C
-front panel. The target unit's radio identity was confirmed from Linux sysfs:
-SDIO vendor `0x02d0`, device `0x4335`. The earlier RTL8822CS assumption came
-from a vendor reference device tree and does not describe this HK2735M PCB
-variant.
+The device tree covers eMMC, microSD, Ethernet, USB, HK2735M wireless,
+infrared input, the power LED, serial console, and the I2C front panel. The
+target module is BCM4335 Wi-Fi plus BCM4335A0 Bluetooth. Linux reports SDIO
+vendor `0x02d0`, device `0x4335`; the UART controller reports Broadcom
+manufacturer `0x000f`, LMP subversion `0x4106`, and local name `BCM4335A0`.
+The earlier RTL8822CS assumption came from a misleading vendor device-tree
+label and does not describe this HK2735M PCB variant.
 
 The BSP selects the upstream `brcmfmac` SDIO driver and Broadcom HCI UART
 support. It retains the lean `armbian-firmware` package, avoiding the roughly
 2.2 GiB installed generic firmware bundle. During every build it fetches the
-exact LibreELEC firmware commit listed above, verifies SHA-256 before use, and
-installs `brcmfmac4335-sdio.bin`, its matching NVRAM text, and BCM4335 A0/B0/C0
-Bluetooth HCD files. Board-specific `vontar,dq08` firmware links point at the
-same verified Wi-Fi payload. The Broadcom binary license is included alongside
-the firmware. The final-image hook verifies the files, hashes, links, and
-required kernel modules; this is software validation, not evidence that a newly
-rebuilt image has passed a hardware radio test.
+exact LibreELEC firmware commit listed above and verifies SHA-256 before use.
+It combines the public `brcmfmac4335-sdio.bin` with the factory DQ08
+`nvram_bcm4335.txt` calibration for the SEMCO B62_G3/4335B0 module. The NVRAM
+is committed as text with only a normalized final newline; its RF parameters
+otherwise match the factory payload. Using the former Murata Type-XJ NVRAM was
+incorrect for this PCB.
+
+The build commits the exact official `BCM4335A0.hcd` extracted from the DQ08
+factory image. Its SHA-256 is pinned, and it is byte-identical to the public
+LibreELEC copy. Only the proven A0 payload is installed: Linux 6.18 maps the
+controller's `0x4106` subversion directly to `BCM4335A0.hcd`. Board-specific
+`vontar,dq08` links point at the selected Wi-Fi firmware and factory-derived
+NVRAM. The Broadcom binary license is included alongside the firmware. The
+final-image hook verifies the files, hashes, links, and required kernel
+modules; runtime scans provide the hardware gate.
+
+Bluetooth bootstrap holds PC2 BT_REG_ON low while driving PC1 HOST_WAKE high
+for 40 ms, raises PC2, holds PC1 high for another 20 ms, returns PC1 to input,
+and settles for 150 ms. UART2 then operates at 115200 bit/s with hardware
+CRTSCTS. The BSP deliberately omits the legacy PA2/RTS GPIO pulse: direct raw
+UART tests proved that HCI Reset succeeds without it and fails after it.
+
+UART2 uses Linux 6.18's corrected RK3528 DMA request order, inherited from
+`rk3528.dtsi` as TX channel 13 and RX channel 12, with the required
+`dma-names = "tx", "rx"` supplied by the board DTS. Mainline fixed that order
+after the ArmSoM Sige1 showed the same `0x0c03` HCI Reset timeout and Broadcom
+`Reset failed (-110)` result. The vendor 5.10 tree's `!tx`/`!rx` PIO choice is
+therefore not carried forward.
+
+The corrected DMA mapping, no-RTS-pulse bootstrap, A0 HCD load, controller
+creation, and bounded Bluetooth scan were validated on the DQ08. Wi-Fi
+firmware initialization, interface creation, and nearby-network scanning were
+validated separately.
 
 The boot partition is 256 MiB; the corrected software-validated build uses
 about 111 MB of its 224 MiB formatted capacity. The board is deliberately
@@ -47,12 +75,10 @@ does not provide the old vendor multimedia stack used by the legacy BSP, so
 HDMI, audio, VPU, and GPU acceleration are outside this module's supported
 scope.
 
-With Bookworm, Linux 6.18.39, and XZ level 1, the validated lean-firmware build
-has a 1,292 MiB root filesystem, a 2,134,900,736-byte (2,036 MiB) raw image,
-and a 418,049,940-byte (398.69 MiB) compressed image. Its compressed SHA-256 is
-`70a066f86871fba3e51cf09c951241847aac248fc9cd594e4d50ddb86ee49a7b`.
-The earlier full-firmware build required a 4,676 MiB raw image and compressed
-to 1,211,780,036 bytes.
+With Bookworm, Linux 6.18.39, and XZ level 1, the lean-firmware build is about
+2.0 GiB raw and 399 MiB compressed. Use the generated `.img.xz.sha` file for
+the exact hash of each build. The earlier full-firmware build required a
+4,676 MiB raw image and compressed to about 1.13 GiB.
 
 ## Repository layout
 
@@ -65,6 +91,8 @@ extensions/dq08-bsp/
   files/                       Files copied into the target root filesystem
 
 kernel/archive/rockchip64-6.18/
+  dq08-bluetooth-factory-bootstrap.patch
+                                 Board-only hci_bcm startup sequence
   dt/rk3528-vontar-dq08.dts    Linux device tree
 
 u-boot/v2026.04/
@@ -234,6 +262,36 @@ xz -dk Armbian-unofficial_*_Vontar-dq08_*_minimal.img.xz
 fdisk -l Armbian-unofficial_*_Vontar-dq08_*_minimal.img
 ~~~
 
+## Flash a Lexar SD card
+
+Run the flasher on the build host, not on the DQ08. Insert the 64 GB Lexar in
+the host reader and identify its whole-disk link without touching its data:
+
+~~~
+lsblk -e 7 -o NAME,PATH,TYPE,SIZE,VENDOR,MODEL,SERIAL,RM,RO,MOUNTPOINTS
+ls -l /dev/disk/by-id/
+~~~
+
+Unmount every target partition manually. The script deliberately refuses any
+mounted target and never unmounts one itself. Use the whole-disk `by-id` link,
+with no `-partN` suffix:
+
+~~~
+IMAGE=armbian-build/output/images/Armbian-unofficial_26.08.0-trunk_Vontar-dq08_bookworm_current_6.18.39_minimal.img.xz
+DEVICE=/dev/disk/by-id/usb-Lexar_<device-id>
+sudo ./dq08-armbian-bsp/flash.sh "$IMAGE" "$DEVICE"
+~~~
+
+The flasher requires the Armbian `${IMAGE}.sha` sidecar produced by
+`COMPRESS_OUTPUTIMAGE=sha,xz`. It fails closed unless the target is a writable,
+removable whole disk of 55--70 GB whose vendor/model/serial identifies Lexar.
+It explicitly rejects the running root-device ancestry, all mounts, swap and
+block holders. After displaying the exact model, serial and byte size, it
+requires an exact typed confirmation. It tests the XZ stream, writes with
+`dd`/`fsync`, flushes device buffers and hashes exactly the uncompressed image
+length back from the Lexar; success is reported only when the source and
+read-back SHA-256 values match.
+
 The build-time final-image check proves that the expected driver and pinned
 files are present. It does not exercise the SDIO bus, radio, antenna, or
 Bluetooth UART. After flashing and booting the newly rebuilt image, first
@@ -288,26 +346,37 @@ ping -I "$wifi_if" -c 5 1.1.1.1
 The default minimal build uses systemd-networkd. `nmcli` applies only when
 building with Armbian's NetworkManager stack.
 
-Check Bluetooth separately; Wi-Fi success does not validate the UART side of
-the combo module:
+Check Bluetooth separately; Wi-Fi success does not validate the UART side:
 
 ~~~
+rfkill unblock bluetooth
+systemctl enable --now bluetooth
+sleep 2
+lsmod | grep -E '^(hci_uart|btbcm|bluetooth)'
+ls -l /sys/class/bluetooth
 journalctl -b -k -o cat --no-pager |
-  grep -Ei 'bluetooth|hci_uart|btbcm|BCM4335'
+  grep -Ei 'ffa00000|DQ08 Bluetooth|bluetooth|hci_uart|btbcm|BCM4335|firmware'
 bluetoothctl list
 bluetoothctl show
+bluetoothctl power on
+timeout 30 bluetoothctl scan on
 ~~~
 
-Do not report BCM4335 Wi-Fi or Bluetooth as hardware-supported for a release
-until these checks pass on the rebuilt image. If the interface is absent,
-collect the complete logs and sysfs values above before changing SDIO timing or
-power-sequence properties.
+`hci_uart` must be present without running `modprobe` manually. A pass has the
+DQ08 startup log, a successful `BCM4335A0.hcd` load, no HCI timeout or
+`BCM: Reset failed`, a controller from `bluetoothctl list`, and nearby devices
+from the bounded scan. This gate passed on the DQ08 with the corrected
+no-RTS-pulse module loaded. The Wi-Fi identity, firmware initialization,
+interface creation, and nearby-network scan gate passed on the same hardware.
 
 ## Firmware provenance
 
-The module does not commit proprietary firmware binaries. During the build it
-fetches exact public repository commits and rejects unexpected hashes. Inspect
-the resolved source revisions with:
+The module commits the factory SEMCO NVRAM and official `BCM4335A0.hcd`, with
+the Broadcom license beside them. The HCD came from Vontar's
+`RK3528_DC_DQ08_Multi_WIFI_13_20240419.2156` factory image and is
+byte-identical to the public LibreELEC copy. The Wi-Fi `.bin` and Rockchip boot
+firmware are fetched from exact commits during the build; every payload is
+checked by SHA-256. Inspect the resolved source revisions with:
 
 ~~~
 git -C armbian-build/cache/sources/vontar-dq08-rkbin rev-parse HEAD
@@ -328,10 +397,8 @@ Verify all selected files:
 ~~~
 sha256sum \
   armbian-build/cache/sources/vontar-dq08-brcmfmac-sdio-firmware/brcmfmac4335-sdio.bin \
-  armbian-build/cache/sources/vontar-dq08-brcmfmac-sdio-firmware/brcmfmac4335-sdio.txt \
-  armbian-build/cache/sources/vontar-dq08-brcmfmac-sdio-firmware/BCM4335A0.hcd \
-  armbian-build/cache/sources/vontar-dq08-brcmfmac-sdio-firmware/BCM4335B0.hcd \
-  armbian-build/cache/sources/vontar-dq08-brcmfmac-sdio-firmware/BCM4335C0.hcd
+  dq08-armbian-bsp/extensions/dq08-bsp/files/usr/lib/firmware/brcm/BCM4335A0.hcd \
+  dq08-armbian-bsp/extensions/dq08-bsp/files/usr/lib/firmware/brcm/brcmfmac4335-sdio.txt
 
 sha256sum \
   armbian-build/cache/sources/vontar-dq08-rkbin/bin/rk35/rk3528_ddr_1056MHz_4BIT_PCB_v1.10.bin \
@@ -342,10 +409,8 @@ Expected SHA-256 values:
 
 ~~~
 1551fd7680db31d230c70f55860ca071331a37eeb54c9229307b8fa475f9d6e7  brcmfmac4335-sdio.bin
-b88c57dbca6be918e3a1676e3c953a32b60ab8b4037f4a7ad1d87860c4160ee6  brcmfmac4335-sdio.txt
+dbe8e44633ac69027cfb7a7f094681578b18415f7b74fe5b033eb34d140891af  brcmfmac4335-sdio.txt
 3e14e7f3c02e19408c5783f845329309e23305ab5f33fb19abfd24a73a84cd8a  BCM4335A0.hcd
-3e14e7f3c02e19408c5783f845329309e23305ab5f33fb19abfd24a73a84cd8a  BCM4335B0.hcd
-5538cd96516729f7d35d7eecdedb0d8a0c441f9ce6d27aa873eb95d8adb59603  BCM4335C0.hcd
 f404365dd3929481052548c220aff3e82238bc7a679f13ab52e7e4e9ca1cfeb4  rk3528_ddr_1056MHz_4BIT_PCB_v1.10.bin
 3dde96556de969c92784e0f37b50a696bd457200353bbb611a91130b0ef960b9  rk3528_bl31_v1.18.elf
 ~~~
@@ -429,8 +494,8 @@ new supported current series:
 4. Update DQ08_KERNEL_SERIES and DQ08_TESTED_KERNEL in module.conf.
 5. Update the kernel path in manifest.txt.
 6. Run verify.sh, config-dump, and a complete clean build.
-7. Boot-test microSD, Ethernet, eMMC, USB, Wi-Fi/Bluetooth, IR, serial, and the
-   front panel before publishing the update.
+7. Boot-test microSD, Ethernet, eMMC, USB, Wi-Fi, Bluetooth, IR, serial, and
+   the front panel before publishing the update.
 
 Do not silently reuse a 6.18 DTS on another series: included RK3528 device-tree
 interfaces can change.
