@@ -12,20 +12,23 @@ The release name and Git tag are:
 dq08-armbian-vX.Y.Z-bsp-vA.B.C
 ```
 
-`vX.Y.Z` is the exact Armbian tag and `vA.B.C` comes from
-`DQ08_MODULE_VERSION` in `module.conf`.
+`vX.Y.Z` is the exact Armbian tag. `vA.B.C` is the normalized
+`DQ08_MODULE_VERSION` from `module.conf`; an optional leading `v` in that value
+is removed.
 
-The image filename carries the same provenance. `build.sh` reads Armbian's
+The Armbian tag version and the build framework's `VERSION` are distinct
+provenance fields and are not assumed to match. `build.sh` reads the literal
 `VERSION` file and enforces:
 
 ```text
-IMAGE_VERSION=<Armbian VERSION>-bsp-v${DQ08_MODULE_VERSION}
+IMAGE_VERSION=<Armbian VERSION>-bsp-v<normalized DQ08_MODULE_VERSION>
 ```
 
-For example, BSP 1.4.9 on Armbian 26.5.1 produces an image name shaped as:
+For example, Armbian tag `v26.5.1` contains framework `VERSION`
+`26.05.0-trunk`. With BSP 1.4.9 it produces an image name shaped as:
 
 ```text
-Armbian-unofficial_26.5.1-bsp-v1.4.9_Vontar-dq08_bookworm_current_<kernel-version>_minimal.img.xz
+Armbian-unofficial_26.05.0-trunk-bsp-v1.4.9_Vontar-dq08_bookworm_current_<kernel-version>_minimal.img.xz
 ```
 
 Caller-supplied `IMAGE_VERSION=...` options are rejected before compilation;
@@ -178,7 +181,8 @@ Before compilation, the controller:
 1. accepts only `vMAJOR.MINOR.PATCH` tags at or after `v26.5.1`;
 2. compares every observed tag with `automation/state.json` on the
    `automation-state` branch and refuses a moved or deleted tag;
-3. checks out the exact Armbian commit;
+3. checks out the exact Armbian commit and records its literal `VERSION`
+   separately from the release tag;
 4. refuses any `rockchip64/current` series other than the BSP's Linux 6.18
    series, without using `--allow-unsupported`;
 5. resolves `linux-6.18.y` once and passes `KERNELBRANCH=commit:<sha>`; and
@@ -200,8 +204,9 @@ build-manifest.json
 
 The hosted publisher safely extracts that bundle and checks the exact file
 count, flat regular-file layout, XZ integrity, SHA-256, image metadata, source
-commits, rkbin hashes, maintainer, Bookworm/current/minimal policy, and the
-strict `< 2 GiB` per-asset limit.
+commits, rkbin hashes, maintainer, Bookworm/current/minimal policy, the exact
+framework `VERSION` in metadata and the image filename, the normalized BSP
+version in the image filename, and the strict `< 2 GiB` per-asset limit.
 
 New releases are created as drafts first. They become public only after all
 four asset names and bytes validate. A partial draft can be resumed only when

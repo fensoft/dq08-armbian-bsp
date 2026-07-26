@@ -12,16 +12,19 @@ from typing import Any
 
 from _lib import (
     ReleaseError,
+    dq08_release_image_suffix,
     dump_json,
     load_json,
     parse_module_conf,
     reject_placeholder,
     release_name,
     require,
+    require_armbian_framework_version,
     require_sha1,
     require_sha256,
     run,
     sha256_file,
+    version_without_v,
 )
 from create_manifest import MANIFEST_NAME, parse_checksum, parse_image_metadata
 
@@ -74,8 +77,15 @@ def validate_manifest_policy(manifest: dict[str, Any], module: dict[str, str]) -
     require(isinstance(armbian_tag, str), "Manifest Armbian tag is missing")
     require(manifest.get("release_name") == release_name(armbian_tag, module["DQ08_MODULE_VERSION"]), "Manifest release_name is inconsistent")
     require(armbian.get("version") == armbian_tag.removeprefix("v"), "Manifest Armbian version/tag mismatch")
+    require_armbian_framework_version(
+        str(armbian.get("framework_version", "")),
+        "manifest Armbian framework_version",
+    )
     require_sha1(str(armbian.get("commit", "")), "manifest Armbian commit")
-    require(bsp.get("version") == module["DQ08_MODULE_VERSION"], "Manifest BSP version differs from module.conf")
+    require(
+        bsp.get("version") == version_without_v(module["DQ08_MODULE_VERSION"]),
+        "Manifest BSP version differs from normalized module.conf",
+    )
     require_sha1(str(bsp.get("commit", "")), "manifest BSP commit")
     require(bsp.get("source_bsp_commit") == module["DQ08_SOURCE_BSP_COMMIT"], "Manifest source BSP commit differs from module.conf")
 
@@ -162,13 +172,23 @@ def validate_stage(stage_dir: Path, module: dict[str, str], preflight: dict[str,
     kernel = manifest["kernel"]
     maintainer = manifest["maintainer"]
     require(metadata["board"] == "Vontar-dq08", "Image metadata has the wrong board")
-    require(metadata["revision"].startswith(armbian["version"]), "Image metadata revision differs from Armbian release")
+    require(
+        metadata["revision"] == armbian["framework_version"],
+        "Image metadata revision differs from checked-out Armbian VERSION",
+    )
     require(metadata["sources_rev"] == armbian["commit"][: len(metadata["sources_rev"])], "Image metadata Sources rev differs from Armbian commit")
     require(metadata["kernel"] == f'Linux {kernel["version"]} (current)', "Image metadata kernel differs from manifest")
     require(metadata["maintainer"] == f'{maintainer["name"]} <{maintainer["email"]}>', "Image metadata maintainer differs from manifest")
     reject_placeholder(metadata["maintainer"], "image metadata maintainer")
-    filename_marker = f'_Vontar-dq08_bookworm_current_{kernel["version"]}_minimal.img.xz'
-    require(image.name.endswith(filename_marker), "Image filename does not describe Bookworm/current/minimal")
+    filename_suffix = dq08_release_image_suffix(
+        armbian["framework_version"],
+        module["DQ08_MODULE_VERSION"],
+        kernel["version"],
+    )
+    require(
+        image.name.endswith(filename_suffix),
+        "Image filename does not describe the exact Armbian/BSP release provenance",
+    )
 
     assets = manifest["assets"]
     for path in (image, checksum_file, metadata_file):

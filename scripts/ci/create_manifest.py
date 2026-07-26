@@ -11,6 +11,7 @@ from typing import Any
 
 from _lib import (
     ReleaseError,
+    dq08_release_image_suffix,
     dump_json,
     git_commit,
     load_json,
@@ -18,9 +19,11 @@ from _lib import (
     reject_placeholder,
     release_name,
     require,
+    require_armbian_framework_version,
     require_sha1,
     require_sha256,
     sha256_file,
+    version_without_v,
 )
 
 
@@ -92,11 +95,18 @@ def validate_preflight(preflight: dict[str, Any], module: dict[str, str]) -> Non
     maintainer = require_object(preflight.get("maintainer"), "preflight maintainer")
 
     require_sha1(str(armbian.get("commit", "")), "preflight Armbian commit")
+    require_armbian_framework_version(
+        str(armbian.get("framework_version", "")),
+        "preflight Armbian framework_version",
+    )
     require_sha1(str(bsp.get("commit", "")), "preflight BSP commit")
     require_sha1(str(kernel.get("commit", "")), "preflight kernel commit")
     require(uboot.get("commit") == module["DQ08_UBOOT_COMMIT"], "Preflight U-Boot commit differs from module.conf")
     require(rkbin.get("commit") == module["DQ08_RKBIN_COMMIT"], "Preflight rkbin commit differs from module.conf")
-    require(bsp.get("version") == module["DQ08_MODULE_VERSION"], "Preflight BSP version differs from module.conf")
+    require(
+        bsp.get("version") == version_without_v(module["DQ08_MODULE_VERSION"]),
+        "Preflight BSP version differs from normalized module.conf",
+    )
     require(kernel.get("series") == module["DQ08_KERNEL_SERIES"], "Preflight kernel series differs from module.conf")
     require(
         preflight.get("release_name") == release_name(str(armbian.get("tag")), module["DQ08_MODULE_VERSION"]),
@@ -161,7 +171,10 @@ def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
 
     metadata = parse_image_metadata(metadata_file)
     require(metadata["board"] == "Vontar-dq08", f"Unexpected image board: {metadata['board']}")
-    require(metadata["revision"].startswith(armbian["version"]), "Image revision does not match the Armbian release")
+    require(
+        metadata["revision"] == armbian["framework_version"],
+        "Image revision does not match the checked-out Armbian VERSION",
+    )
     require(metadata["sources_rev"] == armbian["commit"][: len(metadata["sources_rev"])], "Image Sources rev does not match Armbian commit")
     expected_maintainer = f'{module["DQ08_MAINTAINER"]} <{module["DQ08_MAINTAINER_EMAIL"]}>'
     require(metadata["maintainer"] == expected_maintainer, "Image metadata maintainer differs from module.conf")
@@ -170,8 +183,13 @@ def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
     require(kernel_match is not None, f"Unexpected image kernel metadata: {metadata['kernel']}")
     kernel_version = kernel_match.group(1)  # type: ignore[union-attr]
     require(kernel_version.startswith(kernel["series"] + "."), "Image kernel is outside the pinned kernel series")
-    filename_marker = f"_Vontar-dq08_bookworm_current_{kernel_version}_minimal.img.xz"
-    require(image.name.endswith(filename_marker), f"Image filename does not match fixed release settings: {image.name}")
+    filename_suffix = dq08_release_image_suffix(
+        armbian["framework_version"], module["DQ08_MODULE_VERSION"], kernel_version
+    )
+    require(
+        image.name.endswith(filename_suffix),
+        f"Image filename does not match Armbian/BSP release provenance: {image.name}",
+    )
 
     workflow: dict[str, Any] = {"run_id": args.workflow_run_id}
     if args.workflow_run_attempt is not None:

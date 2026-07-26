@@ -17,6 +17,8 @@ SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 VERSION_RE = re.compile(r"^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 STABLE_ARMBIAN_TAG_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+ARMBIAN_FRAMEWORK_VERSION_RE = re.compile(r"^[0-9][0-9A-Za-z._+-]*$")
+KERNEL_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 
 REQUIRED_MODULE_KEYS = (
     "DQ08_MODULE_VERSION",
@@ -161,6 +163,31 @@ def version_tuple(value: str, label: str = "version") -> tuple[int, int, int]:
 def version_without_v(value: str) -> str:
     version_tuple(value)
     return value.removeprefix("v")
+
+
+def require_armbian_framework_version(value: str, label: str) -> str:
+    require(
+        ARMBIAN_FRAMEWORK_VERSION_RE.fullmatch(value) is not None,
+        f"{label} is not a safe Armbian VERSION value: {value!r}",
+    )
+    return value
+
+
+def dq08_release_image_suffix(
+    armbian_framework_version: str, bsp_version: str, kernel_version: str
+) -> str:
+    framework_version = require_armbian_framework_version(
+        armbian_framework_version, "Armbian framework version"
+    )
+    normalized_bsp_version = version_without_v(bsp_version)
+    require(
+        KERNEL_VERSION_RE.fullmatch(kernel_version) is not None,
+        f"Kernel version is not an exact MAJOR.MINOR.PATCH value: {kernel_version!r}",
+    )
+    return (
+        f"_{framework_version}-bsp-v{normalized_bsp_version}"
+        f"_Vontar-dq08_bookworm_current_{kernel_version}_minimal.img.xz"
+    )
 
 
 def require_sha1(value: str, label: str) -> str:

@@ -64,8 +64,15 @@ def module_conf(values: dict[str, str]) -> str:
 def make_release_fixture(root: Path) -> SimpleNamespace:
     ddr_data = b"test ddr firmware\n"
     bl31_data = b"test bl31 firmware\n"
+    armbian_framework_version = "26.05.0-trunk"
     armbian = root / "armbian"
-    armbian_commit = init_repo(armbian, {"README": "Armbian fixture\n"})
+    armbian_commit = init_repo(
+        armbian,
+        {
+            "README": "Armbian fixture\n",
+            "VERSION": f"{armbian_framework_version}\n",
+        },
+    )
     kernel_dir = armbian / "cache/sources/linux-kernel"
     kernel_commit = init_repo(kernel_dir, {"README": "kernel\n"})
     uboot_dir = armbian / "cache/sources/u-boot"
@@ -76,7 +83,7 @@ def make_release_fixture(root: Path) -> SimpleNamespace:
     rkbin_commit = init_repo(rkbin_dir, {ddr_path: ddr_data, bl31_path: bl31_data})
 
     values = {
-        "DQ08_MODULE_VERSION": "1.2.3",
+        "DQ08_MODULE_VERSION": "v1.2.3",
         "DQ08_BOARD": "vontar-dq08",
         "DQ08_KERNEL_SERIES": "6.18",
         "DQ08_TESTED_KERNEL": "6.18.39",
@@ -98,7 +105,12 @@ def make_release_fixture(root: Path) -> SimpleNamespace:
         "status": "ready",
         "should_build": True,
         "release_name": "dq08-armbian-v26.5.1-bsp-v1.2.3",
-        "armbian": {"tag": "v26.5.1", "version": "26.5.1", "commit": armbian_commit},
+        "armbian": {
+            "tag": "v26.5.1",
+            "version": "26.5.1",
+            "framework_version": armbian_framework_version,
+            "commit": armbian_commit,
+        },
         "bsp": {"version": "1.2.3", "commit": bsp_commit, "source_bsp_commit": "d" * 40},
         "kernel": {
             "series": "6.18",
@@ -139,7 +151,10 @@ def make_release_fixture(root: Path) -> SimpleNamespace:
     preflight_path.write_text(json.dumps(preflight), encoding="utf-8")
     stage = root / "stage"
     stage.mkdir()
-    image_name = "Armbian_26.5.1_Vontar-dq08_bookworm_current_6.18.40_minimal.img.xz"
+    image_name = (
+        f"Armbian_{armbian_framework_version}-bsp-v1.2.3"
+        "_Vontar-dq08_bookworm_current_6.18.40_minimal.img.xz"
+    )
     image = stage / image_name
     image.write_bytes(lzma.compress(b"DQ08 image fixture\n", preset=1))
     image_sha = hashlib.sha256(image.read_bytes()).hexdigest()
@@ -149,7 +164,7 @@ def make_release_fixture(root: Path) -> SimpleNamespace:
         "\n".join(
             (
                 "Generated with Armbian build framework",
-                "Revision:       26.5.1",
+                f"Revision:       {armbian_framework_version}",
                 "Board:          Vontar-dq08",
                 "Kernel:         Linux 6.18.40 (current)",
                 f"Sources rev:    {armbian_commit[:10]}",

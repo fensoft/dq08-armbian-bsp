@@ -13,8 +13,6 @@ fi
 
 armbian_build="$1"
 shift
-release="${1:-bookworm}"
-if (($#)); then shift; fi
 
 for argument in "$@"; do
 	case "${argument}" in
@@ -25,6 +23,18 @@ for argument in "$@"; do
 	esac
 done
 
+release="bookworm"
+if (($#)) && [[ "$1" != *=* ]]; then
+	release="$1"
+	shift
+fi
+
+bsp_version="${DQ08_MODULE_VERSION#v}"
+if [[ ! "${bsp_version}" =~ ^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$ ]]; then
+	printf 'Invalid DQ08_MODULE_VERSION value: %q\n' "${DQ08_MODULE_VERSION}" >&2
+	exit 2
+fi
+
 "${module_root}/install.sh" "${armbian_build}"
 armbian_build="$(cd "${armbian_build}" && pwd -P)"
 
@@ -34,11 +44,11 @@ armbian_version_file="${armbian_build}/VERSION"
 	exit 2
 }
 armbian_revision="$(< "${armbian_version_file}")"
-if [[ ! "${armbian_revision}" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+if [[ ! "${armbian_revision}" =~ ^[0-9][0-9A-Za-z._+-]*$ ]]; then
 	printf 'Unsafe Armbian VERSION value: %q\n' "${armbian_revision}" >&2
 	exit 2
 fi
-image_version="${armbian_revision}-bsp-v${DQ08_MODULE_VERSION}"
+image_version="${armbian_revision}-bsp-v${bsp_version}"
 
 exec "${armbian_build}/compile.sh" build \
 	BOARD="${DQ08_BOARD}" \

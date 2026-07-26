@@ -120,6 +120,9 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(payload["status"], "kernel_port_required")
             self.assertFalse(payload["should_build"])
             self.assertEqual(payload["actual_kernel_series"], "6.19")
+            self.assertEqual(
+                payload["armbian_framework_version"], "26.05.0-trunk"
+            )
 
     def test_ready_preflight_runs_dry_run_install_verify_and_pins_sha(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -174,6 +177,16 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(output.read_text())
             self.assertEqual(payload["status"], "ready")
+            self.assertEqual(payload["armbian"]["tag"], "v26.5.1")
+            self.assertEqual(payload["armbian"]["version"], "26.5.1")
+            self.assertEqual(
+                payload["armbian"]["framework_version"], "26.05.0-trunk"
+            )
+            self.assertNotEqual(
+                payload["armbian"]["version"],
+                payload["armbian"]["framework_version"],
+            )
+            self.assertEqual(payload["bsp"]["version"], "1.2.3")
             self.assertEqual(payload["kernel"]["commit"], fixture.preflight["kernel"]["commit"])
             invocations = [json.loads(line) for line in calls.read_text().splitlines()]
             flattened = [argument for invocation in invocations for argument in invocation]

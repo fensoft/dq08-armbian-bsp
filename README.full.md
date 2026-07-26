@@ -152,11 +152,12 @@ The build wrapper installs the module, then requests:
 - a minimal, non-desktop image;
 - Docker-based compilation;
 - Debian Bookworm by default; and
-- `IMAGE_VERSION=<Armbian VERSION>-bsp-v${DQ08_MODULE_VERSION}`.
+- `IMAGE_VERSION=<Armbian VERSION>-bsp-v<normalized DQ08_MODULE_VERSION>`.
 
 The wrapper reads the two version components from `armbian-build/VERSION` and
-`module.conf`. It rejects a caller-supplied `IMAGE_VERSION=...` option so an
-output filename cannot omit or misstate its BSP revision.
+`module.conf`, removing one optional leading `v` from the module version. It
+rejects a caller-supplied `IMAGE_VERSION=...` option so an output filename
+cannot omit or misstate its BSP revision.
 
 The image appears in:
 

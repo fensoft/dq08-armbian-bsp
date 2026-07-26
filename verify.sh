@@ -50,12 +50,18 @@ if [[ ! "${DQ08_KERNEL_SERIES}" =~ ^[0-9]+[.][0-9]+$ || "${DQ08_TESTED_KERNEL}" 
 	printf 'Tested kernel %s does not match series %s.\n' "${DQ08_TESTED_KERNEL}" "${DQ08_KERNEL_SERIES}" >&2
 	errors=$((errors + 1))
 fi
+if [[ ! "${DQ08_MODULE_VERSION#v}" =~ ^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$ ]]; then
+	printf 'DQ08 module version must be an exact MAJOR.MINOR.PATCH value: %s\n' \
+		"${DQ08_MODULE_VERSION}" >&2
+	errors=$((errors + 1))
+fi
 
 build_script="${module_root}/build.sh"
 for build_policy_fragment in \
 	'IMAGE_VERSION|IMAGE_VERSION=*)' \
 	'armbian_version_file="${armbian_build}/VERSION"' \
-	'image_version="${armbian_revision}-bsp-v${DQ08_MODULE_VERSION}"' \
+	'bsp_version="${DQ08_MODULE_VERSION#v}"' \
+	'image_version="${armbian_revision}-bsp-v${bsp_version}"' \
 	'IMAGE_VERSION="${image_version}"'; do
 	if ! grep -Fq "${build_policy_fragment}" "${build_script}"; then
 		printf 'Build wrapper image-version policy is missing: %s\n' \

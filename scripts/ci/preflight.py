@@ -20,13 +20,24 @@ from _lib import (
     reject_placeholder,
     release_name,
     require,
+    require_armbian_framework_version,
     require_sha1,
     run,
+    version_without_v,
 )
 
 
 DDR_BLOB = "bin/rk35/rk3528_ddr_1056MHz_4BIT_PCB_v1.10.bin"
 BL31_BLOB = "bin/rk35/rk3528_bl31_v1.18.elf"
+
+
+def read_armbian_framework_version(armbian_root: Path) -> str:
+    path = armbian_root / "VERSION"
+    try:
+        value = path.read_text(encoding="utf-8").rstrip("\n")
+    except FileNotFoundError as exc:
+        raise ReleaseError(f"Armbian VERSION file is missing: {path}") from exc
+    return require_armbian_framework_version(value, f"Armbian VERSION in {path}")
 
 
 def current_rockchip64_series(armbian_root: Path) -> str:
@@ -175,7 +186,9 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         actual_armbian_commit == expected_armbian_commit,
         f"Armbian checkout is {actual_armbian_commit}, expected {expected_armbian_commit}",
     )
+    armbian_framework_version = read_armbian_framework_version(armbian_root)
     bsp_commit = git_commit(bsp_root)
+    bsp_version = version_without_v(module["DQ08_MODULE_VERSION"])
 
     actual_series = current_rockchip64_series(armbian_root)
     expected_series = module["DQ08_KERNEL_SERIES"]
@@ -186,6 +199,7 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "should_build": False,
             "armbian_tag": args.armbian_tag,
             "armbian_commit": actual_armbian_commit,
+            "armbian_framework_version": armbian_framework_version,
             "expected_kernel_series": expected_series,
             "actual_kernel_series": actual_series,
             "release_name": release_name(args.armbian_tag, module["DQ08_MODULE_VERSION"]),
@@ -225,10 +239,11 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "armbian": {
             "tag": args.armbian_tag,
             "version": args.armbian_tag.removeprefix("v"),
+            "framework_version": armbian_framework_version,
             "commit": actual_armbian_commit,
         },
         "bsp": {
-            "version": module["DQ08_MODULE_VERSION"],
+            "version": bsp_version,
             "commit": bsp_commit,
             "source_bsp_commit": module["DQ08_SOURCE_BSP_COMMIT"],
         },

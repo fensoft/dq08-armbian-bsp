@@ -26,6 +26,30 @@ class BuildWrapperTests(unittest.TestCase):
             raise AssertionError("DQ08_MODULE_VERSION is missing from module.conf")
         cls.bsp_version = match.group(1)
 
+    def make_module_fixture(self, root: Path, module_version: str) -> Path:
+        module = root / "dq08-armbian-bsp"
+        module.mkdir()
+        wrapper = module / "build.sh"
+        wrapper.write_text(
+            BUILD_WRAPPER.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+
+        module_conf = re.sub(
+            r'^DQ08_MODULE_VERSION="[^"]+"$',
+            f'DQ08_MODULE_VERSION="{module_version}"',
+            MODULE_CONF.read_text(encoding="utf-8"),
+            count=1,
+            flags=re.MULTILINE,
+        )
+        (module / "module.conf").write_text(module_conf, encoding="utf-8")
+
+        install_script = module / "install.sh"
+        install_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        install_script.chmod(0o755)
+        return wrapper
+
     def make_armbian_fixture(
         self, root: Path, armbian_version: str
     ) -> tuple[Path, Path, dict[str, str]]:
@@ -94,10 +118,33 @@ with path.open("a", encoding="utf-8") as handle:
             )
             self.assertIn("DQ08_TEST_ARGUMENT=yes", arguments)
 
+    def test_key_value_in_release_position_uses_default_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            armbian, calls, environment = self.make_armbian_fixture(
+                Path(temporary), "99.88.77-fixture"
+            )
+
+            result = subprocess.run(
+                [str(BUILD_WRAPPER), str(armbian), "DQ08_TEST_ARGUMENT=yes"],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            arguments = json.loads(calls.read_text(encoding="utf-8").strip())
+            self.assertIn("RELEASE=bookworm", arguments)
+            self.assertIn("DQ08_TEST_ARGUMENT=yes", arguments)
+
     def test_rejects_caller_image_version_override(self) -> None:
-        for override in ("IMAGE_VERSION=caller-controlled", "IMAGE_VERSION="):
+        for command_tail in (
+            ("bookworm", "IMAGE_VERSION=caller-controlled"),
+            ("bookworm", "IMAGE_VERSION="),
+            ("IMAGE_VERSION=caller-controlled",),
+            ("IMAGE_VERSION=",),
+        ):
             with (
-                self.subTest(override=override),
+                self.subTest(command_tail=command_tail),
                 tempfile.TemporaryDirectory() as temporary,
             ):
                 armbian, calls, environment = self.make_armbian_fixture(
@@ -105,7 +152,7 @@ with path.open("a", encoding="utf-8") as handle:
                 )
 
                 result = subprocess.run(
-                    [str(BUILD_WRAPPER), str(armbian), "bookworm", override],
+                    [str(BUILD_WRAPPER), str(armbian), *command_tail],
                     text=True,
                     capture_output=True,
                     env=environment,
@@ -117,6 +164,54 @@ with path.open("a", encoding="utf-8") as handle:
                     calls.exists(),
                     "compile.sh must not run when IMAGE_VERSION is caller-controlled",
                 )
+
+    def test_normalizes_one_leading_v_in_module_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            wrapper = self.make_module_fixture(root, "v1.2.3")
+            armbian, calls, environment = self.make_armbian_fixture(
+                root, "99.88.77-fixture"
+            )
+
+            result = subprocess.run(
+                [str(wrapper), str(armbian)],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            arguments = json.loads(calls.read_text(encoding="utf-8").strip())
+            self.assertIn(
+                "IMAGE_VERSION=99.88.77-fixture-bsp-v1.2.3",
+                arguments,
+            )
+            self.assertNotIn(
+                "IMAGE_VERSION=99.88.77-fixture-bsp-vv1.2.3",
+                arguments,
+            )
+
+    def test_rejects_unsafe_module_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            wrapper = self.make_module_fixture(root, "1.2.3/unsafe")
+            armbian, calls, environment = self.make_armbian_fixture(
+                root, "99.88.77-fixture"
+            )
+
+            result = subprocess.run(
+                [str(wrapper), str(armbian)],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("DQ08_MODULE_VERSION", result.stderr)
+            self.assertFalse(
+                calls.exists(),
+                "compile.sh must not run with an unsafe BSP module version",
+            )
 
 
 if __name__ == "__main__":

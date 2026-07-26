@@ -38,13 +38,14 @@ git -C armbian-build checkout --detach 90fda43901b0127104227975ae62d35fbad05abc
 and enforces:
 
 ```text
-IMAGE_VERSION=<Armbian VERSION>-bsp-v${DQ08_MODULE_VERSION}
+IMAGE_VERSION=<Armbian VERSION>-bsp-v<normalized DQ08_MODULE_VERSION>
 ```
 
 It reads the Armbian revision from `armbian-build/VERSION` and the BSP revision
-from `module.conf`. Do not pass `IMAGE_VERSION=...` as an extra option:
-caller overrides are rejected so the filename always identifies both source
-versions. The image is written to `armbian-build/output/images/`.
+from `module.conf`, removing one optional leading `v`. Do not pass
+`IMAGE_VERSION=...` as an extra option: caller overrides are rejected so the
+filename always identifies both source versions. The image is written to
+`armbian-build/output/images/`.
 
 ## Flash
 
